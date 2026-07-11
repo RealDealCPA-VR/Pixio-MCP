@@ -366,6 +366,50 @@ async def test_generate_submit_failure_releases_budget_reservation(
     assert runtime.budget.session_spent == 0, "no submit -> no spend recorded"
 
 
+async def test_generate_send_phase_failure_keeps_budget_reservation(
+    runtime: Runtime, mock_api: MockAPI
+) -> None:
+    """A read timeout after the POST was sent must NOT release the hold.
+
+    Regression: the request may have reached the gateway — which then
+    creates and bills the job — even though the response was lost, so
+    releasing the reservation would let ``session_spent`` undercount real
+    spend and the session budget be exceeded by up to one job's estimate.
+    """
+    mock_api.on("POST", "/generations/estimate", _estimate_route(5))
+
+    def read_timeout_route(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("read timed out", request=request)
+
+    mock_api.on("POST", "/generate", read_timeout_route)
+
+    result = await generate(MODEL_ID, {"prompt": "a cat"}, wait=True)
+
+    err = _error(result)
+    assert err["code"] == "UPSTREAM_ERROR"
+    assert "budget_note" in err["details"]
+    assert len(_generate_posts(mock_api)) == 1, "POST /generate is never retried"
+    # Submission outcome unknown -> the reserved estimate stays counted.
+    assert runtime.budget.session_spent == 5
+
+
+async def test_generate_connect_failure_releases_budget_reservation(
+    runtime: Runtime, mock_api: MockAPI
+) -> None:
+    """A connect-phase failure provably never reached the gateway -> release."""
+    mock_api.on("POST", "/generations/estimate", _estimate_route(5))
+
+    def connect_error_route(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused", request=request)
+
+    mock_api.on("POST", "/generate", connect_error_route)
+
+    result = await generate(MODEL_ID, {"prompt": "a cat"}, wait=True)
+
+    assert _error(result)["code"] == "UPSTREAM_ERROR"
+    assert runtime.budget.session_spent == 0, "not delivered -> nothing spent"
+
+
 async def test_poll_phase_error_result_still_carries_generation_id(
     runtime: Runtime, mock_api: MockAPI, monkeypatch: pytest.MonkeyPatch
 ) -> None:

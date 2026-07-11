@@ -13,6 +13,8 @@ import random
 import time
 from typing import Any
 
+import httpx
+
 from pixio_mcp.errors import ErrorCode, PixioError, tool_guard
 from pixio_mcp.pathguard import find_local_paths
 from pixio_mcp.runtime import get_runtime
@@ -81,6 +83,34 @@ def _job_result(
         "elapsed_s": elapsed_s,
         "error": record.get("error"),
     }
+
+
+def _submission_provably_not_billed(exc: BaseException) -> bool:
+    """Classify a ``POST /generate`` failure for budget-reservation handling.
+
+    Returns True only when the failure proves no job was created (and so
+    nothing was billed): the request never reached the gateway (connect-phase
+    transport error), the pre-flight AUTH check refused to send it, or the
+    gateway itself answered with an HTTP error (it rejected the request
+    without creating a job).
+
+    Returns False for ambiguous failures — a transport error after the
+    connection was established (e.g. ``httpx.ReadTimeout``: the POST was
+    delivered but the response was lost) or a cancellation mid-flight — where
+    the gateway may well have created and billed the job even though we never
+    saw its id.
+    """
+    if not isinstance(exc, PixioError):
+        # CancelledError or any unexpected exception mid-flight: unknown.
+        return False
+    cause = exc.__cause__
+    if isinstance(cause, (httpx.ConnectError, httpx.ConnectTimeout)):
+        return True  # the request provably never reached the gateway
+    if isinstance(cause, httpx.RequestError):
+        return False  # sent (at least partially); the job may exist and bill
+    # No transport cause: pre-flight AUTH, or an HTTP error response the
+    # gateway returned instead of creating a job.
+    return True
 
 
 async def _fetch_balance() -> int | None:
@@ -271,9 +301,30 @@ async def generate(
     # Step 3 — submit. The client never auto-retries this POST.
     try:
         generation_id = await rt.client.generate(model_id, params)
-    except BaseException:
-        # Nothing was submitted, so nothing was spent — release the hold.
-        rt.budget.release(reservation)
+    except BaseException as exc:
+        if _submission_provably_not_billed(exc):
+            # Nothing was submitted, so nothing was spent — release the hold.
+            rt.budget.release(reservation)
+        else:
+            # Ambiguous send-phase failure (e.g. read timeout or cancellation
+            # after the POST hit the wire): the gateway may have created and
+            # billed the job even though its id was never seen. Keep the
+            # reserved estimate counted against the session budget so
+            # session_spent never undercounts real spend.
+            logger.warning(
+                "generate submission outcome unknown (%s); keeping the "
+                "reserved estimate of %s credits counted against the "
+                "session budget",
+                type(exc).__name__,
+                estimated or 0,
+            )
+            if isinstance(exc, PixioError):
+                exc.details.setdefault(
+                    "budget_note",
+                    "the submission outcome is unknown (the request may have "
+                    "reached the gateway); the estimated cost remains counted "
+                    "against the session budget",
+                )
         raise
 
     # Step 4 — re-key the reserved estimate under the real generation id.
