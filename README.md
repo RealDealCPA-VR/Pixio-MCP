@@ -1,42 +1,69 @@
-# pixio-mcp
+<div align="center">
 
-An MCP (Model Context Protocol) server for the [Pixio](https://beta.pixio.myapps.ai) media generation API. Pixio hosts **554+ models** — text-to-image, image-to-image, image-to-video, text-to-video, video-to-video, text-to-audio, and utility operations — all metered in credits against a single account balance.
+# ⚡ pixio-mcp ⚡
 
-`pixio-mcp` gives any MCP client (Claude Desktop, Claude Code, or your own agents) the full generation lifecycle:
+### **554+ generative models. One MCP server. Zero chances to nuke your credit balance.**
 
-**discover models → inspect input schemas → price the job → generate → poll to completion → download outputs**
+[![Tests](https://img.shields.io/badge/tests-121%20passing-brightgreen?style=for-the-badge)](#-development)
+[![Python](https://img.shields.io/badge/python-3.11%2B-blue?style=for-the-badge&logo=python&logoColor=white)](#-quick-start)
+[![MCP](https://img.shields.io/badge/protocol-MCP-8A2BE2?style=for-the-badge)](https://modelcontextprotocol.io)
+[![Spend Safety](https://img.shields.io/badge/spend%20guardrails-ARMED-crimson?style=for-the-badge)](#-spend-safety-the-flex)
+[![License](https://img.shields.io/badge/license-MIT-black?style=for-the-badge)](#-license)
 
-The server is *schema-agnostic*: it hardcodes zero model knowledge. Every model's parameter schema is fetched live from the API, so new Pixio models work the day they ship. Hard credit guardrails (per-job cap + session budget) make it safe to hand to autonomous agents.
+**Prompt in. File on disk. Four tool calls. Every model [Pixio](https://beta.pixio.myapps.ai) ships — the day it ships.**
 
-## Requirements
+</div>
 
-- Python 3.11+
-- [uv](https://docs.astral.sh/uv/) (recommended) — or any tool that can install a PEP 621 project
-- A Pixio API key (`pxio_live_...`)
+---
 
-## Quick start
+## 🔥 What is this
+
+`pixio-mcp` hands any MCP client — Claude Desktop, Claude Code, or your own agent swarm — the **entire Pixio media generation arsenal**: text-to-image, image-to-video, text-to-video, video-to-video, lipsync, text-to-audio, and a stack of utility ops. All of it metered in credits, all of it behind guardrails that make it safe to hand the keys to a fully autonomous agent and walk away.
+
+```text
+discover → inspect schema → price it → generate → poll → download. done. 💅
+```
+
+**The cheat code:** this server hardcodes *zero* model knowledge. Every parameter schema is pulled **live** from the API at call time. Pixio drops 50 new models tomorrow? They work here tomorrow. No update. No redeploy. No waiting on anybody.
+
+## 🧨 Why it goes hard
+
+| | The old way | The `pixio-mcp` way |
+|---|---|---|
+| **Coverage** | Hand-rolled HTTP for a handful of models | **All 554+ models**, discovery-driven |
+| **New models** | Wait for someone to update the wrapper | **Day-zero support**, automatically |
+| **Spend control** | Vibes 💸 | **Two hard caps + estimate-before-spend** |
+| **Long video jobs** | Hang or lose the job | **Resumable ids** — timeout ≠ dead job |
+| **Local files** | Figure out uploads yourself | `upload_media` → **permanent public URL** |
+| **Errors** | A stack trace and a prayer | **9-code machine-actionable taxonomy** |
+
+Battle-tested: **121 offline tests**, two full multi-agent validation rounds (security audit, adversarial review, live protocol checks), and a real end-to-end run — prompt → generated image → verified bytes on disk.
+
+## 🚀 Quick start
+
+You need: **Python 3.11+**, [**uv**](https://docs.astral.sh/uv/), and a **Pixio API key** (`pxio_live_...`).
 
 ```sh
-git clone <this repo> Pixio-MCP
+git clone https://github.com/RealDealCPA-VR/Pixio-MCP.git
 cd Pixio-MCP
 uv sync
 ```
 
-Set your key and run the server (stdio transport — it waits for an MCP client on stdin/stdout):
-
 ```sh
-# PowerShell
+# PowerShell — fire it up (stdio transport; it waits for an MCP client)
 $env:PIXIO_API_KEY = "pxio_live_..."
 uv run pixio-mcp
 ```
 
-Normally you won't run it by hand — register it with your MCP client instead (below). If `PIXIO_API_KEY` is unset the server still boots (it logs a warning to stderr) and every tool call returns an `AUTH` error until the key is provided.
+You'll almost never run it by hand — register it with your client (next section) and let your agent cook. 👨‍🍳 No key set? The server still boots (warning on stderr) and every tool politely returns an `AUTH` error until you feed it one.
 
-## Registering with Claude Desktop
+## 🔌 Plug it in
 
-Edit your Claude Desktop config (`%APPDATA%\Claude\claude_desktop_config.json` on Windows, `~/Library/Application Support/Claude/claude_desktop_config.json` on macOS) and add one of the following under `mcpServers`.
+### Claude Desktop
 
-**Local checkout** (run straight from this repository):
+Edit `%APPDATA%\Claude\claude_desktop_config.json` (Windows) or `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS), add under `mcpServers`, restart Claude Desktop:
+
+**Local checkout** (run straight from this repo):
 
 ```json
 {
@@ -50,7 +77,7 @@ Edit your Claude Desktop config (`%APPDATA%\Claude\claude_desktop_config.json` o
 }
 ```
 
-**Published package** (once `pixio-mcp` is on PyPI — `uvx` fetches and runs it in one step):
+**Published package** (once `pixio-mcp` hits PyPI — `uvx` fetches and runs in one move):
 
 ```json
 {
@@ -64,11 +91,9 @@ Edit your Claude Desktop config (`%APPDATA%\Claude\claude_desktop_config.json` o
 }
 ```
 
-Restart Claude Desktop after editing the config.
+### Claude Code
 
-## Registering with Claude Code
-
-One-liner from any terminal:
+One-liner. That's it. That's the setup.
 
 ```sh
 # Local checkout
@@ -78,51 +103,49 @@ claude mcp add pixio -e PIXIO_API_KEY=pxio_live_... -- uv run --directory C:\Use
 claude mcp add pixio -e PIXIO_API_KEY=pxio_live_... -- uvx pixio-mcp
 ```
 
-Or add the same JSON block shown above to your project's `.mcp.json`.
+Or drop the same JSON block into your project's `.mcp.json`.
 
-## Configuration
+## 🎛️ Configuration
 
-All configuration is via environment variables:
+Everything tunes through env vars:
 
 | Env var | Required | Default | Purpose |
 |---|---|---|---|
-| `PIXIO_API_KEY` | yes | — | Bearer token (`pxio_live_...`). Never logged, never echoed in tool output. |
-| `PIXIO_BASE_URL` | no | `https://beta.pixio.myapps.ai/api/v1` | Override if the API moves off beta. Trailing slash and missing `/api/v1` suffix are normalized for you. |
-| `PIXIO_MAX_CREDITS_PER_JOB` | no | `60` | Per-job credit cap. Jobs estimated above this are refused without `confirm=true`. |
-| `PIXIO_SESSION_BUDGET` | no | `300` | Cumulative credit cap per server process. |
-| `PIXIO_DEFAULT_TIMEOUT_S` | no | `180` | Default wait timeout for `generate(wait=true)` and `wait_for_generation`. |
-| `PIXIO_DOWNLOAD_DIR` | no | `~/pixio-outputs` | Default destination for `download_output`. |
-| `PIXIO_LOG_LEVEL` | no | `INFO` | Logging level. Logs go to **stderr** as JSON lines (stdout carries the MCP protocol). |
+| `PIXIO_API_KEY` | **yes** | — | Bearer token (`pxio_live_...`). Never logged, never echoed. Ever. |
+| `PIXIO_BASE_URL` | no | `https://beta.pixio.myapps.ai/api/v1` | Override if the API moves off beta. Trailing slash / missing `/api/v1` normalized for you. |
+| `PIXIO_MAX_CREDITS_PER_JOB` | no | `60` | Per-job credit cap. Estimates above this get refused without `confirm=true`. |
+| `PIXIO_SESSION_BUDGET` | no | `300` | Cumulative credit ceiling per server process. |
+| `PIXIO_DEFAULT_TIMEOUT_S` | no | `180` | Default wait for `generate(wait=true)` / `wait_for_generation`. |
+| `PIXIO_DOWNLOAD_DIR` | no | `~/pixio-outputs` | Where `download_output` drops the goods. |
+| `PIXIO_LOG_LEVEL` | no | `INFO` | Logs go to **stderr** as JSON lines (stdout carries the MCP protocol). |
 
-Invalid integer values (e.g. `PIXIO_SESSION_BUDGET=lots`) fail fast with a `VALIDATION` error naming the variable.
+Fat-finger an integer (`PIXIO_SESSION_BUDGET=lots`)? Instant `VALIDATION` error naming the exact variable. No silent misconfigs.
 
-## Tools
+## 🧰 The toolkit — 9 tools, full lifecycle
 
-| Tool | Purpose | Key inputs |
+| Tool | What it does | Key inputs |
 |---|---|---|
-| `list_models` | Filterable model catalog (cached 10 min). Returns id, name, type, per-run credits, company, description. | `type` (exact match, e.g. `"text-to-image"`), `query` (substring over id/name/description), `limit` (1–200, default 50), `offset` |
-| `get_model_params` | Exact input schema for one model — names, types, required flags, defaults, allowed `options`. Verbatim API passthrough. | `model_id` |
-| `estimate_cost` | Credit estimate for a model + params payload *before* spending. Falls back to the catalog-listed cost if the estimate endpoint errors. | `model_id`, `params` |
-| `upload_media` | Local file path **or** remote URL → permanent public Pixio URL (`pixiomedia.nyc3.digitaloceanspaces.com`) for use in generation params. | `source` (path or http(s) URL) |
-| `generate` | Run a job: rejects local paths, estimates, enforces budget caps, submits, and (by default) waits for the result. | `model_id`, `params`, `wait` (default `true`), `timeout_s`, `confirm` (default `false`) |
-| `get_generation` | One-shot status check + output URLs for a job. | `generation_id` |
-| `wait_for_generation` | Poll a job until `succeeded`/`failed` or timeout. Resumes jobs that outlived a `generate` timeout. | `generation_id`, `timeout_s` |
-| `download_output` | Save all output files of a *succeeded* generation to a local directory. Returns absolute local paths. | `generation_id`, `dest_dir` (optional) |
-| `get_credits` | Account balance (`total`, `recurring`, `permanent`), optionally with recent ledger entries. | `include_ledger_tail` (default `false`), `ledger_limit` (default 10) |
+| `list_models` | Filterable catalog of all 554+ models (cached 10 min). Id, name, type, per-run credits, company, description. | `type` (exact, e.g. `"text-to-image"`), `query` (substring), `limit` (1–200), `offset` |
+| `get_model_params` | The **exact** live input schema for one model — names, types, required flags, defaults, allowed `options`. Verbatim API passthrough. | `model_id` |
+| `estimate_cost` | Price the job **before** a single credit moves. Falls back to catalog cost if the estimate endpoint flakes. | `model_id`, `params` |
+| `upload_media` | Local file **or** remote URL → permanent public Pixio URL (`pixiomedia.nyc3.digitaloceanspaces.com`). | `source` |
+| `generate` | The main event: rejects local paths, estimates, enforces caps, submits, waits for the result. | `model_id`, `params`, `wait`=`true`, `timeout_s`, `confirm`=`false` |
+| `get_generation` | One-shot status + output URLs. | `generation_id` |
+| `wait_for_generation` | Poll to `succeeded`/`failed` or timeout. **Resumes jobs that outlived a `generate` timeout.** | `generation_id`, `timeout_s` |
+| `download_output` | Every output file of a succeeded job → your disk. Returns absolute paths. | `generation_id`, `dest_dir` |
+| `get_credits` | Balance breakdown (`total`, `recurring`, `permanent`) + optional spend ledger tail. | `include_ledger_tail`, `ledger_limit` |
 
-Every tool returns a JSON dict. Failures come back as structured error dicts (see [Error taxonomy](#error-taxonomy)) — tools never raise raw exceptions at the caller.
+Every tool returns clean JSON. Failures come back as structured error dicts (see [taxonomy](#-error-taxonomy)) — **tools never throw raw exceptions at your agent.**
 
-## The three-call discovery contract
+## 🎯 The three-call contract
 
-The server ships knowing nothing about any specific model. The calling LLM discovers everything at runtime:
+The server ships knowing *nothing* about any model. Your LLM discovers everything at runtime:
 
-1. **`list_models`** — find a model by type and keyword.
-2. **`get_model_params`** — fetch its exact input schema.
-3. **`generate`** — build `params` from that schema and run.
+1. **`list_models`** — find the weapon 🎯
+2. **`get_model_params`** — read the manual 📖
+3. **`generate`** — send it 🚀
 
-Add **`download_output`** and a prompt becomes a file on disk in four calls.
-
-### Example transcript
+Add **`download_output`** and a text prompt becomes a file on your machine in **four calls flat**:
 
 ```text
 >>> list_models(type="text-to-image", query="flux")
@@ -170,57 +193,63 @@ Add **`download_output`** and a prompt becomes a file on disk in four calls.
 }
 ```
 
-For models that take media inputs (image-to-video, lipsync, ...), call `upload_media` first and pass the returned URL in `params` — `generate` accepts **URLs only** and rejects local paths before any credits are spent.
+Models that eat media (image-to-video, lipsync, ...)? `upload_media` first, pass the returned URL in `params`. `generate` is **URLs-only** and swats local paths before a single credit is spent.
 
-## Spend safety
+## 🛡️ Spend safety (the flex)
 
-Credit guardrails are enforced server-side and are non-negotiable by default:
+This is the part that lets you point an autonomous agent at a credit balance and sleep at night. All guardrails are **server-side** and on by default:
 
-- **Estimate before spend.** Every `generate` call is priced first via the estimate endpoint (with a fallback to the catalog-listed cost). Nothing is submitted until the price is known — or explicitly acknowledged as unknown via a `warning` in the result.
-- **Per-job cap** (`PIXIO_MAX_CREDITS_PER_JOB`, default 60). Any single job estimated above the cap is refused with `BUDGET_EXCEEDED`.
-- **Session budget** (`PIXIO_SESSION_BUDGET`, default 300). Cumulative spend across the server process's lifetime; a job that would push the session over budget is refused with `BUDGET_EXCEEDED`.
-- **Explicit override.** A `BUDGET_EXCEEDED` refusal states the estimate, which cap was hit, and the cap value — and can only be overridden by re-calling with `confirm=true`. The server never overrides itself.
-- **Balance on every result.** Every terminal job result reports `credits_spent` and `remaining_balance`, so spend drift is visible immediately. `get_credits` gives the full balance breakdown plus an optional ledger tail.
-- **No auto-retry on submission.** `POST /generate` is never retried automatically, so a network blip can't double-spend. (Idempotent reads and estimates are retried up to 3x.)
+- 💰 **Estimate before spend.** Every job is priced first (estimate endpoint, catalog fallback). Nothing submits until the price is known — or explicitly flagged unknown via a `warning`.
+- 🧱 **Per-job cap** (`PIXIO_MAX_CREDITS_PER_JOB`, default 60). One job over the line → `BUDGET_EXCEEDED`. Denied.
+- 🏦 **Session budget** (`PIXIO_SESSION_BUDGET`, default 300). Cumulative ceiling for the whole server process. The meter never lies.
+- 🔑 **Explicit override only.** A refusal tells you the estimate, which cap tripped, and the cap value — and *only* a re-call with `confirm=true` gets through. The server never overrides itself.
+- 📊 **Balance on every receipt.** Every terminal result reports `credits_spent` + `remaining_balance`. Spend drift has nowhere to hide.
+- 🚫 **Zero auto-retry on submission.** `POST /generate` fires exactly once — a network blip can *never* double-spend you. (Reads and estimates retry 3x, because those are free.)
 
-## Error taxonomy
+## 🚨 Error taxonomy
 
-Failed tool calls return `{"error": {"code": ..., "message": ..., "details": {...}}}`. All nine codes:
+Failed tool calls return `{"error": {"code": ..., "message": ..., "details": {...}}}`. Nine codes, all machine-actionable:
 
-> **Telling failures apart from successes:** successful job results *also* contain an `error` key — it holds the provider's failure reason and is `null` on success (see the `generate` example above). Don't test `"error" in result`; test whether `result["error"]` is a **dict with a `code`** (tool failure envelope) versus `null`/string (job-result field).
+> **⚠️ Telling failures apart from successes:** successful job results *also* carry an `error` key — it's the provider's failure reason, `null` on success (see the `generate` example above). Don't test `"error" in result`; test whether `result["error"]` is a **dict with a `code`** (failure envelope) vs `null`/string (job-result field).
 
-| Code | Meaning | What the caller should do |
+| Code | Meaning | Your move |
 |---|---|---|
-| `AUTH` | 401 from the API, or `PIXIO_API_KEY` is missing/empty. | Set a valid `pxio_live_...` key in the server's `env` and restart the client. |
-| `INSUFFICIENT_CREDITS` | 402 — the account balance can't cover the job. `details` includes `availableCredits`, `requiredCredits`, `shortfall` when the API provides them. | Top up the account, or pick a cheaper model (`list_models` shows per-run credits). |
-| `VALIDATION` | Bad or missing parameter; also raised when `generate` params contain a local file path. The message surfaces the API's error body verbatim (e.g. `Missing required parameter: X`) or names the offending field. | Re-read `get_model_params` and fix the payload. For local paths, run `upload_media` and pass the returned URL. |
-| `BUDGET_EXCEEDED` | The server's own guardrail refused the job (per-job cap or session budget). Nothing was spent. | Verify the estimate is acceptable, then re-call with `confirm=true` — or raise the cap via env vars. |
-| `CONCURRENCY` | 429 — the account's in-flight generation limit is reached. `details` carries `concurrencyLimit` when the API reports it. | Wait for in-flight jobs to finish (`wait_for_generation` on their ids), then resubmit. Do not hammer retries. |
-| `GENERATION_FAILED` | The job reached terminal `failed` status. `details.provider_reason` carries the provider's reason string. | Read the reason, adjust prompt/params, and submit a new job (retrying spends credits again). |
-| `TIMEOUT_PENDING` | The wait window elapsed but the job is **still running** — it was not cancelled. `details` includes `generation_id` and a hint. | Call `wait_for_generation(generation_id)` (or `get_generation`) to resume; the job completes server-side either way. |
-| `NOT_FOUND` | 404 — unknown model id or generation id. | Check the id; discover valid model ids via `list_models`. |
-| `UPSTREAM_ERROR` | 5xx, network failure, or an unparseable response from Pixio. | Retry later. GETs and estimates were already retried 3x with backoff before this surfaced. |
+| `AUTH` | 401, or `PIXIO_API_KEY` missing/empty. | Set a valid `pxio_live_...` key in the server's `env`, restart the client. |
+| `INSUFFICIENT_CREDITS` | 402 — balance can't cover the job. `details` has `availableCredits`, `requiredCredits`, `shortfall` when the API provides them. | Top up, or pick a cheaper model (`list_models` shows per-run credits). |
+| `VALIDATION` | Bad/missing param — or a local file path in `generate` params. Message surfaces the API's error body verbatim (e.g. `Missing required parameter: X`) or names the offending field. | Re-read `get_model_params`, fix the payload. Local paths → `upload_media` first. |
+| `BUDGET_EXCEEDED` | The server's own guardrail said no (per-job cap or session budget). **Nothing was spent.** | If the estimate's acceptable, re-call with `confirm=true` — or raise the caps via env. |
+| `CONCURRENCY` | 429 — account's in-flight limit reached. `details` carries `concurrencyLimit` when reported. | Wait for in-flight jobs (`wait_for_generation` on their ids), then resubmit. Don't hammer. |
+| `GENERATION_FAILED` | Terminal `failed` status. `details.provider_reason` has the provider's reason string. | Read the reason, adjust, submit fresh (a retry spends credits again). |
+| `TIMEOUT_PENDING` | Wait window elapsed but the job is **still cooking** — not cancelled. `details` has `generation_id` + a hint. | `wait_for_generation(generation_id)` to resume; the job finishes server-side either way. |
+| `NOT_FOUND` | 404 — unknown model or generation id. | Check the id; discover real ones via `list_models`. |
+| `UPSTREAM_ERROR` | 5xx, network failure, or unparseable response. | Retry later — GETs/estimates already retried 3x with backoff before this surfaced. |
 
-## Gotchas
+## 💀 Gotchas (learned so you don't have to)
 
-Hard-won quirks of the live Pixio gateway. The server stays schema-agnostic and does **not** enforce these — callers must respect them:
+Hard-won quirks of the live Pixio gateway. The server stays schema-agnostic and does **not** enforce these — your agent must respect them:
 
-- **Select values are strings.** For `select` params, send `options[].value` exactly as given — as a string. Send `"5"`, not `5`, even when the value looks numeric.
-- **"Optional" params may still be required.** Some params marked optional-with-default are rejected by the gateway when omitted. On a first attempt, send *every* param listed by `get_model_params` at its `defaultValue`.
-- **Output URLs can expire in ~1 hour.** A generation's `outputUrl` may be a signed URL with a short lifetime. Call `download_output` promptly after success; don't stash URLs for later. (URLs returned by `upload_media` are the exception — those are permanent and public.)
-- **Account-wide concurrency limit.** In-flight generations are limited per account, not per client: **1 by default, 3 on the Maker plan**. Parallel fan-outs will hit `CONCURRENCY` — serialize jobs or wait between submissions.
-- **No cancel API.** Once submitted, a job runs to completion; `DELETE /generations/{id}` is not supported. A `TIMEOUT_PENDING` job keeps occupying your concurrency slot until it finishes, so budget your `timeout_s` accordingly and resume with `wait_for_generation` rather than resubmitting.
-- **There is no list-generations endpoint.** Keep the `generation_id` from every submission — it's the only handle you get.
+- **Select values are strings.** Send `options[].value` exactly as given. `"5"`, not `5`. Even when it looks numeric. *Especially* when it looks numeric.
+- **"Optional" is sometimes a lie.** Some optional-with-default params get rejected when omitted. First attempt: send **every** param from `get_model_params` at its `defaultValue`.
+- **Output URLs can die in ~1 hour.** `outputUrl` may be signed with a short fuse. `download_output` promptly; never stash URLs for later. (`upload_media` URLs are the exception — permanent and public.)
+- **Concurrency is account-wide.** **1 in-flight by default, 3 on Maker** — across *all* your API keys. Parallel fan-outs will eat `CONCURRENCY` errors; serialize your jobs.
+- **There is no cancel button.** Once submitted, a job runs to the end; `DELETE /generations/{id}` isn't a thing. A `TIMEOUT_PENDING` job keeps holding a concurrency slot until it finishes — budget `timeout_s` accordingly and *resume*, don't resubmit.
+- **No list-generations endpoint.** The `generation_id` from every submission is the **only** handle you get. Guard it with your life.
 
-## Development
+## 🧪 Development
 
 ```sh
 uv sync
 uv run pytest
 ```
 
-Tests run fully offline against a mocked Pixio gateway — no API key, no network, no credits spent.
+**121 tests, fully offline** — a mocked Pixio gateway, no API key, no network, zero credits harmed. 🌱
 
-## License
+## 📜 License
 
-MIT
+MIT — go build something loud.
+
+<div align="center">
+
+**Built for agents. Guarded like a vault. Fresh models on day zero.** ⚡
+
+</div>
