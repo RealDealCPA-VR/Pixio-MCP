@@ -255,3 +255,86 @@ async def test_download_sends_auth_to_pixio_host(
         r for r in mock_api.requests if r.url.path.endswith("/hosted/asset.png")
     )
     assert request.headers.get("authorization") == f"Bearer {TEST_KEY}"
+
+
+@pytest.fixture
+def lan_settings(tmp_path: Path) -> Settings:
+    """Settings pointing PIXIO_BASE_URL at a non-Pixio localhost gateway."""
+    return Settings.from_env(
+        env={
+            "PIXIO_API_KEY": TEST_KEY,
+            "PIXIO_BASE_URL": "http://127.0.0.1:8123",
+            "PIXIO_DOWNLOAD_DIR": str(tmp_path / "outputs"),
+        }
+    )
+
+
+@pytest.fixture
+async def lan_client(
+    lan_settings: Settings, mock_api: MockAPI
+) -> AsyncIterator[PixioClient]:
+    """A PixioClient configured for the localhost gateway base_url."""
+    pixio_client = PixioClient(lan_settings, transport=mock_api.transport)
+    try:
+        yield pixio_client
+    finally:
+        await pixio_client.aclose()
+
+
+async def test_download_sends_auth_to_configured_base_url_host(
+    lan_client: PixioClient, mock_api: MockAPI, tmp_path: Path
+) -> None:
+    # v1.1 addendum #6: a PIXIO_BASE_URL localhost/LAN gateway gets authed
+    # downloads even though its host is not *.pixio.myapps.ai.
+    dest = tmp_path / "gateway-out.png"
+    written = await lan_client.download("http://127.0.0.1:8123/files/out.png", dest)
+    assert written == len(PNG_BYTES)
+    assert dest.read_bytes() == PNG_BYTES
+    request = next(
+        r for r in mock_api.requests if r.url.path.endswith("/files/out.png")
+    )
+    assert request.headers.get("authorization") == f"Bearer {TEST_KEY}"
+
+
+async def test_download_with_custom_base_url_still_omits_auth_for_unrelated_host(
+    lan_client: PixioClient, mock_api: MockAPI, tmp_path: Path
+) -> None:
+    # v1.1 addendum #6: the base_url-host rule must not widen the token's
+    # reach — third-party CDNs still never see the Authorization header.
+    dest = tmp_path / "cdn-out.png"
+    written = await lan_client.download(CDN_OUTPUT_URL, dest)
+    assert written == len(PNG_BYTES)
+    cdn_requests = [r for r in mock_api.requests if r.url.host == "cdn.example"]
+    assert cdn_requests, "download never hit the CDN host"
+    for request in cdn_requests:
+        assert "authorization" not in request.headers
+
+
+async def test_301_redirect_maps_to_upstream_error_with_location_detail(
+    client: PixioClient, mock_api: MockAPI
+) -> None:
+    # v1.1 addendum #6: 3xx API responses are a misconfigured PIXIO_BASE_URL,
+    # not a caller-input problem — UPSTREAM_ERROR, never VALIDATION.
+    final_url = "https://beta.pixio.myapps.ai/api/v1/models"
+    mock_api.on(
+        "GET", "/models", httpx.Response(301, headers={"location": final_url})
+    )
+    with pytest.raises(PixioError) as excinfo:
+        await client.get_models()
+    err = excinfo.value
+    assert err.code == ErrorCode.UPSTREAM_ERROR
+    payload = err.to_dict()["error"]
+    assert payload["details"]["location"] == final_url
+    assert "redirect" in payload["message"].lower()
+    assert "PIXIO_BASE_URL" in payload["message"]
+
+
+async def test_3xx_redirect_without_location_has_null_location_detail(
+    client: PixioClient, mock_api: MockAPI
+) -> None:
+    mock_api.on("GET", "/credits", httpx.Response(302))
+    with pytest.raises(PixioError) as excinfo:
+        await client.get_credits()
+    err = excinfo.value
+    assert err.code == ErrorCode.UPSTREAM_ERROR
+    assert err.to_dict()["error"]["details"] == {"location": None}

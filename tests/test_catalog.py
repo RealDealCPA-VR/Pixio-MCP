@@ -1,19 +1,23 @@
 """Offline tests for ``tools/catalog.py``.
 
 Covers the ``list_models`` contract shape, exact type filtering, case-insensitive
-query matching across id/name/description, limit clamping (1..200), offset
-paging, description truncation, catalog caching (single upstream GET /models
-for repeated calls, expiry via an injectable clock), and ``get_model_params``
-verbatim passthrough plus the unknown-model NOT_FOUND mapping.
+query matching across id/name/description, limit clamping (1..200) and the
+context-economy default of 20, offset paging, description truncation, catalog
+caching (single upstream GET /models for repeated calls, expiry via an
+injectable clock), ``get_model_params`` verbatim passthrough plus the
+unknown-model NOT_FOUND mapping, model_id whitespace/backtick stripping, and
+the v1.1 requirement that every tool parameter carries a Field description.
 
 All tests run against the ``MockAPI`` transport from conftest — no network.
 """
 
 from __future__ import annotations
 
+import inspect
 from typing import Any
 
 import httpx
+from pydantic.fields import FieldInfo
 
 from conftest import MockAPI
 from pixio_mcp.budget import BudgetGuard
@@ -125,6 +129,24 @@ def _big_catalog(count: int = 250) -> dict[str, Any]:
             for i in range(count)
         ]
     }
+
+
+def _field_descriptions(func: Any) -> dict[str, str | None]:
+    """Map each parameter of a tool to its pydantic Field description (or None).
+
+    ``inspect.signature`` follows ``__wrapped__`` through the ``tool_guard``
+    decorator, and ``eval_str=True`` resolves the PEP-563 string annotations in
+    the tool module's globals — exactly how FastMCP builds the input schema.
+    """
+    sig = inspect.signature(func, eval_str=True)
+    descriptions: dict[str, str | None] = {}
+    for name, param in sig.parameters.items():
+        description: str | None = None
+        for meta in getattr(param.annotation, "__metadata__", ()):
+            if isinstance(meta, FieldInfo) and meta.description:
+                description = meta.description
+        descriptions[name] = description
+    return descriptions
 
 
 def _models_requests(mock_api: MockAPI) -> list[httpx.Request]:
@@ -346,3 +368,70 @@ async def test_get_model_params_unknown_model_maps_not_found(
     assert result["error"]["code"] == "NOT_FOUND"
     assert isinstance(result["error"]["message"], str)
     assert result["error"]["message"]
+
+
+async def test_default_limit_is_20(runtime: Runtime, mock_api: MockAPI) -> None:
+    """v1.1 addendum #4: the default page size is 20 (context economy)."""
+    _install_catalog(mock_api, _big_catalog(250))
+
+    result = await list_models()
+    assert "error" not in result
+    assert result["returned"] == 20
+    assert len(result["models"]) == 20
+    assert result["total_matching"] == 250
+
+    # The declared signature default matches the behavior.
+    assert inspect.signature(list_models).parameters["limit"].default == 20
+
+
+async def test_get_model_params_strips_whitespace_and_backticks(
+    runtime: Runtime, mock_api: MockAPI
+) -> None:
+    """v1.1 addendum #3: model_id is stripped of whitespace and backticks."""
+    mock_api.on("GET", "/params", lambda _req: httpx.Response(200, json=PARAMS_BODY))
+
+    result = await get_model_params("\t `pixio/flux-1/schnell` \n")
+    assert "error" not in result
+    assert result == PARAMS_BODY
+
+    params_requests = [
+        req for req in mock_api.requests if req.url.path.endswith("/params")
+    ]
+    assert len(params_requests) == 1
+    assert params_requests[0].url.params["modelId"] == "pixio/flux-1/schnell"
+
+
+def test_every_catalog_tool_parameter_has_field_description() -> None:
+    """v1.1 addendum #1: every parameter carries a short Field description."""
+    for tool in (list_models, get_model_params):
+        descriptions = _field_descriptions(tool)
+        assert descriptions, f"{tool.__name__} has no parameters to describe?"
+        for name, description in descriptions.items():
+            assert description, f"{tool.__name__}({name}) is missing a Field description"
+            assert len(description) <= 120, (
+                f"{tool.__name__}({name}) description exceeds 120 chars"
+            )
+
+    # The limit description steers small-context callers toward filtering.
+    limit_description = _field_descriptions(list_models)["limit"]
+    assert limit_description is not None
+    assert "type" in limit_description and "query" in limit_description
+
+    # model_id includes a concrete example id.
+    model_id_description = _field_descriptions(get_model_params)["model_id"]
+    assert model_id_description is not None
+    assert "pixio/flux-1/schnell" in model_id_description
+
+
+def test_catalog_tools_annotate_dict_str_any_return() -> None:
+    """v1.1 addendum #4: tools declare -> dict[str, Any] uniformly."""
+    for tool in (list_models, get_model_params):
+        sig = inspect.signature(tool, eval_str=True)
+        assert sig.return_annotation == dict[str, Any], tool.__name__
+
+
+def test_catalog_docstrings_have_no_args_section() -> None:
+    """v1.1 addendum #4: Args: sections are gone (Field descriptions replace them)."""
+    for tool in (list_models, get_model_params):
+        doc = inspect.getdoc(tool) or ""
+        assert "Args:" not in doc, tool.__name__

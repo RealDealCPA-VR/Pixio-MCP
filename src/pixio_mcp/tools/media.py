@@ -10,8 +10,10 @@ from __future__ import annotations
 import logging
 import re
 from pathlib import Path, PurePosixPath
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Annotated, Any
 from urllib.parse import unquote, urlsplit
+
+from pydantic import Field
 
 from pixio_mcp.errors import ErrorCode, PixioError, tool_guard
 from pixio_mcp.runtime import get_runtime
@@ -33,6 +35,15 @@ _MAGIC_SNIFF_LEN = 16
 #: separators, dots, ...) is replaced so a hostile generation_id can never
 #: traverse out of dest_dir.
 _STEM_UNSAFE_RE = re.compile(r"[^A-Za-z0-9_-]")
+
+#: Characters LLM callers commonly wrap identifiers in (markdown backticks,
+#: stray whitespace) — stripped at tool entry per the v1.1 input-leniency rule.
+_IDENT_STRIP_CHARS = "` \t\r\n"
+
+
+def _strip_identifier(value: str) -> str:
+    """Strip surrounding whitespace and backticks from an id-like argument."""
+    return value.strip(_IDENT_STRIP_CHARS)
 
 
 def _safe_stem_prefix(generation_id: str) -> str:
@@ -141,7 +152,18 @@ async def _download_one(client: PixioClient, url: str, dest_dir: Path, stem: str
 
 
 @tool_guard
-async def upload_media(source: str) -> dict[str, Any]:
+async def upload_media(
+    source: Annotated[
+        str,
+        Field(
+            description=(
+                "http(s) URL to mirror or local file path to upload "
+                "(~ expands); data: URLs go directly in generate params "
+                "instead."
+            )
+        ),
+    ],
+) -> dict[str, Any]:
     """Upload a local file or mirror a remote URL to Pixio, returning a permanent public media URL.
 
     Use this before ``generate`` whenever a model parameter needs media
@@ -151,17 +173,20 @@ async def upload_media(source: str) -> dict[str, Any]:
     and publicly readable, and is exactly what generate's media params
     (e.g. ``image_url``) expect — pass it through verbatim.
 
-    Args:
-        source: An http(s) URL (mirrored server-side into Pixio storage) or a
-            local file path (``~`` is expanded; uploaded as multipart).
-            Directories are rejected.
-
     Returns:
         ``{"url": str, "source_kind": "local_file" | "remote_url",
         "file_name": str, "size_bytes": int | None}`` — ``size_bytes`` is
         None for remote URLs (the file never transits this machine).
     """
     rt = get_runtime()
+
+    if source.lstrip().lower().startswith("data:"):
+        raise PixioError(
+            ErrorCode.VALIDATION,
+            "data: URLs don't need uploading — pass them directly in "
+            "generate params, or provide an http(s) URL / local file path",
+            details={"source_scheme": "data"},
+        )
 
     if _is_http_url(source):
         url = await rt.client.upload_url(source)
@@ -209,7 +234,21 @@ async def upload_media(source: str) -> dict[str, Any]:
 
 
 @tool_guard
-async def download_output(generation_id: str, dest_dir: str | None = None) -> dict[str, Any]:
+async def download_output(
+    generation_id: Annotated[
+        str,
+        Field(description='Generation id returned by generate, e.g. "gen-123".'),
+    ],
+    dest_dir: Annotated[
+        str | None,
+        Field(
+            description=(
+                "Target directory, created if missing (~ expands); defaults "
+                "to PIXIO_DOWNLOAD_DIR (~/pixio-outputs)."
+            )
+        ),
+    ] = None,
+) -> dict[str, Any]:
     """Download every output file of a succeeded generation to a local directory.
 
     Call this after ``generate(wait=true)`` or ``wait_for_generation`` reports
@@ -220,12 +259,6 @@ async def download_output(generation_id: str, dest_dir: str | None = None) -> di
     returns a VALIDATION error stating the current status; for a failed
     generation the provider's reason is included in the details.
 
-    Args:
-        generation_id: The id returned by ``generate``.
-        dest_dir: Target directory, created if missing (``~`` is expanded).
-            Defaults to the server's configured download directory
-            (``PIXIO_DOWNLOAD_DIR``, default ``~/pixio-outputs``).
-
     Returns:
         ``{"generation_id": str, "files": [absolute file paths], "dest_dir": str}``
         — files are named ``{generation_id[:8]}-{index}{ext}`` (id prefix
@@ -234,6 +267,7 @@ async def download_output(generation_id: str, dest_dir: str | None = None) -> di
     """
     rt = get_runtime()
 
+    generation_id = _strip_identifier(generation_id)
     generation = await rt.client.get_generation(generation_id)
     status = str(generation.get("status") or "unknown")
 
@@ -273,7 +307,19 @@ async def download_output(generation_id: str, dest_dir: str | None = None) -> di
         )
 
     base = Path(dest_dir).expanduser() if dest_dir is not None else rt.settings.download_dir
-    base.mkdir(parents=True, exist_ok=True)
+    try:
+        base.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        # v1.1 addendum #7: an un-creatable dest_dir (occupied by a file,
+        # permission denied, invalid characters, ...) is caller input error,
+        # not an upstream failure.
+        raise PixioError(
+            ErrorCode.VALIDATION,
+            f"dest_dir '{base}' cannot be created or is not a usable "
+            f"directory ({type(exc).__name__}). Pass a writable directory "
+            "path as dest_dir.",
+            details={"dest_dir": str(base), "os_error": str(exc)},
+        ) from exc
 
     stem_prefix = _safe_stem_prefix(generation_id)
     files: list[str] = []

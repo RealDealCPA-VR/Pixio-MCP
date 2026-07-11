@@ -3,19 +3,25 @@
 Covers the generate/wait lifecycle against the MockAPI gateway: happy path
 (contract job-result shape), fire-and-forget ``wait=False``, the poll loop,
 wait-timeout resume (# AC-4), failed-generation mapping (# AC-8), budget
-refusal + confirm override (# AC-3), session-budget trips, and budget
-reconciliation of estimated vs actual credits.
+refusal + confirm override (# AC-3), session-budget trips, budget
+reconciliation of estimated vs actual credits, the estimate==0 cap-bypass fix
+(v1.1 addendum #2), input leniency (addendum #3), and docstring/schema
+context economy (addendum #1/#4).
 """
 
 from __future__ import annotations
 
 import asyncio
-from typing import TYPE_CHECKING, Any, Callable
+import inspect
+import json
+from typing import TYPE_CHECKING, Any, Callable, get_type_hints
 
 import httpx
 import pytest
+from pydantic.fields import FieldInfo
 
 from pixio_mcp.tools import generation as generation_module
+from pixio_mcp.tools.credits import PARAMS_TYPE_MESSAGE
 from pixio_mcp.tools.generation import generate, get_generation, wait_for_generation
 
 if TYPE_CHECKING:
@@ -70,6 +76,31 @@ def _gen_route(status: str, **overrides: Any) -> Callable[[httpx.Request], httpx
         return httpx.Response(200, json=body)
 
     return route
+
+
+def _catalog_route(
+    models: list[dict[str, Any]],
+) -> Callable[[httpx.Request], httpx.Response]:
+    """Route callable overriding ``GET /models`` with an explicit catalog."""
+
+    def route(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"models": models})
+
+    return route
+
+
+def _catalog_model(model_id: str, credits: int) -> dict[str, Any]:
+    """Minimal live-shaped catalog entry."""
+    return {
+        "id": model_id,
+        "providerId": "pixio",
+        "name": model_id,
+        "description": "test model",
+        "type": "text-to-image",
+        "credits": credits,
+        "company": "Test",
+        "inputs": [],
+    }
 
 
 def _estimate_route(estimated: int) -> Callable[[httpx.Request], httpx.Response]:
@@ -452,3 +483,152 @@ async def test_get_generation_returns_job_shape_from_single_get(
     assert result["remaining_balance"] == 1000
     assert isinstance(result["elapsed_s"], float)
     assert len(_poll_gets(mock_api)) == 1
+
+
+async def test_generate_zero_estimate_uses_catalog_cost_for_budget(
+    runtime: Runtime, mock_api: MockAPI
+) -> None:
+    """Addendum #2 regression: estimatedCost 0 must not bypass the caps.
+
+    estimate 0 + catalog 295 -> the budget check runs against 295, so an
+    unconfirmed generate is refused with BUDGET_EXCEEDED and NO POST
+    /generate ever leaves the client.
+    """
+    mock_api.on("POST", "/generations/estimate", _estimate_route(0))
+    mock_api.on("GET", "/models", _catalog_route([_catalog_model(MODEL_ID, 295)]))
+
+    result = await generate(MODEL_ID, {"prompt": "a cat"}, wait=True)
+
+    err = _error(result)
+    assert err["code"] == "BUDGET_EXCEEDED"
+    assert err["details"]["estimated_credits"] == 295
+    assert err["details"]["per_job_cap"] == 60
+    assert _generate_posts(mock_api) == [], "0-estimate must not bypass the caps"
+    assert runtime.budget.session_spent == 0
+
+
+async def test_generate_zero_estimate_zero_catalog_proceeds_free(
+    runtime: Runtime, mock_api: MockAPI
+) -> None:
+    """Addendum #2: estimate 0 + catalog 0 is genuinely free -> proceeds."""
+    mock_api.on("POST", "/generations/estimate", _estimate_route(0))
+    mock_api.on("GET", "/models", _catalog_route([_catalog_model(MODEL_ID, 0)]))
+
+    result = await generate(MODEL_ID, {"prompt": "a cat"}, wait=False)
+
+    assert not isinstance(result.get("error"), dict)
+    assert result["status"] == "processing"
+    assert result["estimated_credits"] == 0
+    assert "warning" not in result
+    assert len(_generate_posts(mock_api)) == 1
+    assert runtime.budget.session_spent == 0
+
+
+async def test_generate_zero_estimate_unknown_catalog_warns_and_proceeds(
+    runtime: Runtime, mock_api: MockAPI
+) -> None:
+    """Addendum #2: estimate 0 + catalog unknown -> warning, 0 against budget."""
+    mock_api.on("POST", "/generations/estimate", _estimate_route(0))
+    mock_api.on(
+        "GET",
+        "/models",
+        _catalog_route([_catalog_model("pixio/other/model", 5)]),
+    )
+
+    result = await generate(MODEL_ID, {"prompt": "a cat"}, wait=False)
+
+    assert not isinstance(result.get("error"), dict)
+    assert result["status"] == "processing"
+    assert result["estimated_credits"] is None
+    assert isinstance(result.get("warning"), str) and result["warning"]
+    assert len(_generate_posts(mock_api)) == 1
+    assert runtime.budget.session_spent == 0, "unknown estimate counts 0"
+
+
+async def test_generate_accepts_params_as_json_string_end_to_end(
+    runtime: Runtime, mock_api: MockAPI, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Addendum #3: params passed as '{"prompt":"hi"}' works end-to-end."""
+    _install_fast_sleep(monkeypatch)
+
+    result = await generate(MODEL_ID, '{"prompt": "hi"}', wait=True)
+
+    assert not isinstance(result.get("error"), dict)
+    assert result["status"] == "succeeded"
+    posts = _generate_posts(mock_api)
+    assert len(posts) == 1
+    body = json.loads(posts[0].content)
+    assert body["params"] == {"prompt": "hi"}
+
+
+async def test_generate_non_dict_params_string_is_validation(
+    runtime: Runtime, mock_api: MockAPI
+) -> None:
+    """Addendum #3: a double-encoded non-object ('"[1, 2]"') -> VALIDATION."""
+    result = await generate(MODEL_ID, '"[1, 2]"')
+
+    err = _error(result)
+    assert err["code"] == "VALIDATION"
+    assert err["message"] == PARAMS_TYPE_MESSAGE
+    assert mock_api.requests == [], "invalid params must fail before any request"
+    assert runtime.budget.session_spent == 0
+
+
+async def test_generate_strips_backticks_and_whitespace_from_model_id(
+    runtime: Runtime, mock_api: MockAPI
+) -> None:
+    """Addendum #3: ' `pixio/flux-1/schnell` ' resolves like the clean id."""
+    result = await generate(" `pixio/flux-1/schnell` ", {"prompt": "a cat"}, wait=False)
+
+    assert not isinstance(result.get("error"), dict)
+    assert result["model_id"] == MODEL_ID
+    posts = _generate_posts(mock_api)
+    assert len(posts) == 1
+    assert json.loads(posts[0].content)["modelId"] == MODEL_ID
+
+
+async def test_wait_and_get_strip_generation_id(
+    runtime: Runtime, mock_api: MockAPI, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Addendum #3: generation_id leniency on get/wait tools."""
+    _install_fast_sleep(monkeypatch)
+
+    fetched = await get_generation(" `gen-123` ")
+    assert not isinstance(fetched.get("error"), dict)
+    assert fetched["generation_id"] == "gen-123"
+
+    waited = await wait_for_generation("\t`gen-123`\n")
+    assert not isinstance(waited.get("error"), dict)
+    assert waited["generation_id"] == "gen-123"
+    assert waited["status"] == "succeeded"
+
+
+def test_generation_tool_schemas_context_economy() -> None:
+    """Addendum #1/#4: Field descriptions everywhere, no Args:, tight generate doc."""
+    for tool in (generate, get_generation, wait_for_generation):
+        doc = inspect.getdoc(tool) or ""
+        assert doc, f"{tool.__name__} must keep a docstring"
+        assert "Args:" not in doc, f"{tool.__name__} docstring must drop Args:"
+        hints = get_type_hints(tool, include_extras=True)
+        assert str(hints["return"]).startswith("dict"), tool.__name__
+        for name in inspect.signature(tool).parameters:
+            metadata = getattr(hints[name], "__metadata__", ())
+            descriptions = [
+                meta.description
+                for meta in metadata
+                if isinstance(meta, FieldInfo) and meta.description
+            ]
+            assert descriptions, f"{tool.__name__}.{name} needs a Field description"
+            assert all(len(d) <= 120 for d in descriptions), (
+                f"{tool.__name__}.{name} description over 120 chars"
+            )
+
+    generate_doc = inspect.getdoc(generate) or ""
+    assert len(generate_doc) <= 1600, "generate docstring must stay ~1500 chars"
+    # The six load-bearing elements the addendum requires generate to retain.
+    assert "list_models -> get_model_params" in generate_doc  # 3-call contract
+    assert "upload_media" in generate_doc  # URLs-only pointer
+    assert "STRINGS" in generate_doc  # select values as strings
+    assert "confirm=true" in generate_doc  # cap override
+    assert "wait_for_generation(generation_id)" in generate_doc  # resume hint
+    assert 'result["error"] is a dict' in generate_doc  # error discriminator

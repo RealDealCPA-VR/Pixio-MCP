@@ -4,12 +4,32 @@ version = "0.1.0"
 description = "MCP server for the Pixio media generation API: discover models, price jobs, generate, poll, download — with hard credit guardrails."
 readme = "README.md"
 requires-python = ">=3.11"
-license = { text = "MIT" }
+license = "MIT"
 authors = [{ name = "Valentino Rivera" }]
+keywords = [
+    "mcp",
+    "pixio",
+    "image-generation",
+    "video-generation",
+    "model-context-protocol",
+    "ai-agents",
+]
+classifiers = [
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Operating System :: OS Independent",
+    "Topic :: Multimedia :: Graphics",
+    "Intended Audience :: Developers",
+]
 dependencies = [
     "mcp>=1.2.0",
     "httpx>=0.27.0",
 ]
+
+[project.urls]
+Repository = "https://github.com/RealDealCPA-VR/Pixio-MCP"
+Issues = "https://github.com/RealDealCPA-VR/Pixio-MCP/issues"
 
 [project.scripts]
 pixio-mcp = "pixio_mcp.server:main"

@@ -11,14 +11,15 @@ import asyncio
 import logging
 import random
 import time
-from typing import Any
+from typing import Annotated, Any
 
 import httpx
+from pydantic import Field
 
 from pixio_mcp.errors import ErrorCode, PixioError, tool_guard
 from pixio_mcp.pathguard import find_local_paths
 from pixio_mcp.runtime import get_runtime
-from pixio_mcp.tools.credits import resolve_estimate
+from pixio_mcp.tools.credits import clean_id, coerce_params, resolve_estimate
 
 __all__ = ["generate", "get_generation", "wait_for_generation"]
 
@@ -210,70 +211,85 @@ async def _poll(generation_id: str, timeout_s: float) -> dict:
 
 @tool_guard
 async def generate(
-    model_id: str,
-    params: dict,
-    wait: bool = True,
-    timeout_s: int | None = None,
-    confirm: bool = False,
-) -> dict:
+    model_id: Annotated[
+        str,
+        Field(description='Model id from list_models, e.g. "pixio/flux-1/schnell".'),
+    ],
+    params: Annotated[
+        dict[str, Any] | str,
+        Field(
+            description=(
+                "Inputs from get_model_params; media values must be "
+                "http(s)/data: URLs. JSON object; JSON string accepted."
+            )
+        ),
+    ],
+    wait: Annotated[
+        bool,
+        Field(
+            description=(
+                "Poll to completion (default true); false returns "
+                'immediately with status "processing".'
+            )
+        ),
+    ] = True,
+    timeout_s: Annotated[
+        int | None,
+        Field(
+            description=(
+                "Max seconds to wait when wait=true; default "
+                "PIXIO_DEFAULT_TIMEOUT_S (180)."
+            )
+        ),
+    ] = None,
+    confirm: Annotated[
+        bool,
+        Field(
+            description=(
+                "Set true to override the per-job and session credit caps "
+                "for this one job."
+            )
+        ),
+    ] = False,
+) -> dict[str, Any]:
     """Run a media generation job on Pixio, with spend guardrails.
 
-    This is the final step of the 3-call discovery contract:
-    ``list_models`` -> ``get_model_params`` -> ``generate``. Build ``params``
-    from the live ``get_model_params(model_id)`` response — this server
-    embeds no model schemas. On a first attempt send EVERY param the schema
-    lists, at its default value (some params marked optional are actually
-    required by the gateway), and send select-option values as STRINGS
-    (e.g. "5", not 5).
+    Final step of the 3-call contract: list_models -> get_model_params ->
+    generate. Build params strictly from the live get_model_params
+    response; on a first attempt send EVERY listed param at its default
+    (some "optional" params are required by the gateway), and send select
+    values as STRINGS ("5", not 5).
 
-    URLs-only contract: every media input inside ``params`` must be an
-    http(s) or data: URL. Any value that looks like a local filesystem path
-    (``~``, ``./``, ``../``, ``file://``, ``X:\\``, UNC ``\\\\``, or an
-    existing file) is rejected with a VALIDATION error naming the offending
-    field(s) — before any credits are spent. Call ``upload_media`` first and
-    pass the permanent URL it returns.
+    URLs only: media inputs in params must be http(s) or data: URLs; local
+    file paths are rejected (VALIDATION, naming the fields) before any
+    spend — call upload_media first and pass the URL it returns.
 
-    Spend guardrails: the job cost is estimated up front and refused with
-    BUDGET_EXCEEDED if it exceeds the per-job cap or would exceed the
-    session budget — no credits are spent on a refusal. Pass ``confirm=true``
-    to explicitly override both caps for this one job.
+    Guardrails: the cost is estimated up front; jobs over the per-job cap
+    or session budget are refused with BUDGET_EXCEEDED (nothing spent).
+    Pass confirm=true to override both caps for this one job.
 
-    Waiting: with ``wait=true`` (default) this call polls until the job is
-    terminal or ``timeout_s`` elapses (default: PIXIO_DEFAULT_TIMEOUT_S,
-    180s). On timeout you get a TIMEOUT_PENDING error whose details carry
-    the ``generation_id`` — the job KEEPS RUNNING server-side; resume with
-    ``wait_for_generation(generation_id)``. With ``wait=false`` the call
-    returns immediately (status "processing", plus ``estimated_credits``);
-    check later with ``get_generation`` or ``wait_for_generation``.
+    wait=true (default) polls until terminal or timeout_s; on timeout a
+    TIMEOUT_PENDING error carries the generation_id — the job KEEPS
+    RUNNING server-side; resume with wait_for_generation(generation_id).
+    wait=false returns immediately (status "processing", plus
+    "estimated_credits").
 
-    Output URLs may be signed and expire after roughly an hour — call
-    ``download_output(generation_id)`` promptly.
+    Output URLs may be signed and expire in ~1h — call
+    download_output(generation_id) promptly.
 
-    Args:
-        model_id: Pixio model id, e.g. "pixio/flux-1/schnell".
-        params: Generation inputs built from ``get_model_params`` (URLs only
-            for media fields).
-        wait: Poll to completion (True, default) or return immediately.
-        timeout_s: Max seconds to wait when ``wait=true``; None uses the
-            server default.
-        confirm: Set True to override the per-job and session credit caps.
-
-    Returns:
-        On success: {"generation_id", "status", "output_urls", "outputs",
-        "model_id", "credits_spent", "remaining_balance", "elapsed_s",
-        "error"}. With ``wait=false``: the same shape with status
-        "processing", ``credits_spent`` None, and ``estimated_credits``
-        added. On failure: {"error": {"code", "message", "details"}} with
-        code VALIDATION, BUDGET_EXCEEDED, INSUFFICIENT_CREDITS, CONCURRENCY,
-        GENERATION_FAILED, TIMEOUT_PENDING, NOT_FOUND, AUTH, or
-        UPSTREAM_ERROR. NOTE: success results also contain an "error" key
-        (the provider reason, null on success) — a call failed only when
-        result["error"] is a dict carrying a "code".
+    Returns {"generation_id", "status", "output_urls", "outputs",
+    "model_id", "credits_spent", "remaining_balance", "elapsed_s",
+    "error"}; on failure {"error": {"code", "message", "details"}}. NOTE:
+    success results also carry an "error" key (provider reason, null on
+    success) — a call failed only when result["error"] is a dict with a
+    "code".
     """
     started = time.monotonic()
+    model_id = clean_id(model_id)
+    parsed_params = coerce_params(params)
 
     # Step 1 — URLs-only enforcement, before any network call or spend.
-    hits = find_local_paths(params)
+    hits = find_local_paths(parsed_params)
     if hits:
         fields = [f"params.{path}" for path, _ in hits]
         noun = (
@@ -297,12 +313,12 @@ async def generate(
     # reserve() checks the caps AND records the estimate in one synchronous
     # step, so concurrent generate() calls cannot race between check and
     # record and collectively overspend the session budget.
-    estimated, source, warning = await resolve_estimate(model_id, params)
+    estimated, source, warning = await resolve_estimate(model_id, parsed_params)
     reservation = rt.budget.reserve(estimated or 0, confirm)
 
     # Step 3 — submit. The client never auto-retries this POST.
     try:
-        generation_id = await rt.client.generate(model_id, params)
+        generation_id = await rt.client.generate(model_id, parsed_params)
     except BaseException as exc:
         if _submission_provably_not_billed(exc):
             # Nothing was submitted, so nothing was spent — release the hold.
@@ -342,7 +358,7 @@ async def generate(
 
     # Step 5 — fire-and-forget path.
     if not wait:
-        result: dict = {
+        result: dict[str, Any] = {
             "generation_id": generation_id,
             "status": "processing",
             "output_urls": [],
@@ -368,27 +384,29 @@ async def generate(
 
 
 @tool_guard
-async def get_generation(generation_id: str) -> dict:
+async def get_generation(
+    generation_id: Annotated[
+        str,
+        Field(description='Generation id returned by generate, e.g. "gen-123".'),
+    ],
+) -> dict[str, Any]:
     """Fetch the current status and outputs of one generation (no polling).
 
-    A single ``GET /generations/{id}`` snapshot. Use this to check on a job
-    started with ``generate(wait=false)`` or after a TIMEOUT_PENDING; use
-    ``wait_for_generation`` instead if you want to block until it finishes.
+    A single GET snapshot. Use this to check on a job started with
+    generate(wait=false) or after a TIMEOUT_PENDING; use wait_for_generation
+    instead if you want to block until it finishes.
 
-    Statuses: "processing" -> "succeeded" | "failed". ``remaining_balance``
-    is only fetched (best-effort) once the job is terminal; while
-    processing it is None, as is ``credits_spent``.
+    Statuses: "processing" -> "succeeded" | "failed". "remaining_balance" is
+    only fetched (best-effort) once the job is terminal; while processing it
+    is null, as is "credits_spent".
 
-    Args:
-        generation_id: Id returned by ``generate``.
-
-    Returns:
-        {"generation_id", "status", "output_urls", "outputs", "model_id",
-        "credits_spent", "remaining_balance", "elapsed_s", "error"} —
-        ``error`` carries the provider reason when status is "failed".
-        On failure: {"error": {"code", "message", "details"}} (e.g.
-        NOT_FOUND for an unknown id).
+    Returns {"generation_id", "status", "output_urls", "outputs",
+    "model_id", "credits_spent", "remaining_balance", "elapsed_s", "error"}
+    — "error" carries the provider reason when status is "failed". On
+    failure: {"error": {"code", "message", "details"}} (e.g. NOT_FOUND for
+    an unknown id).
     """
+    generation_id = clean_id(generation_id)
     rt = get_runtime()
     started = time.monotonic()
     record = await rt.client.get_generation(generation_id)
@@ -406,35 +424,39 @@ async def get_generation(generation_id: str) -> dict:
 
 @tool_guard
 async def wait_for_generation(
-    generation_id: str,
-    timeout_s: int | None = None,
-) -> dict:
+    generation_id: Annotated[
+        str,
+        Field(description='Generation id returned by generate, e.g. "gen-123".'),
+    ],
+    timeout_s: Annotated[
+        int | None,
+        Field(
+            description=(
+                "Max seconds to wait; default PIXIO_DEFAULT_TIMEOUT_S (180)."
+            )
+        ),
+    ] = None,
+) -> dict[str, Any]:
     """Block until a generation reaches a terminal status, or time out.
 
-    Resumes waiting on any in-flight job — most usefully after ``generate``
-    returned TIMEOUT_PENDING, or for a job started with ``wait=false``.
-    Polls with backoff (2s growing to a 10s cap, jittered) until the job is
-    "succeeded" or "failed", or until ``timeout_s`` elapses (default:
-    PIXIO_DEFAULT_TIMEOUT_S, 180s). Budget actuals are reconciled from the
-    job's real ``creditsCost`` when it completes.
+    Resumes waiting on any in-flight job — most usefully after generate
+    returned TIMEOUT_PENDING, or for a job started with wait=false. Polls
+    with backoff (2s growing to a 10s cap, jittered) until the job is
+    "succeeded" or "failed", or until timeout_s elapses. Budget actuals are
+    reconciled from the job's real creditsCost when it completes.
 
-    On timeout the TIMEOUT_PENDING error again carries the
-    ``generation_id`` — the job keeps running server-side and this tool can
-    be called as many times as needed.
+    On timeout the TIMEOUT_PENDING error again carries the generation_id —
+    the job keeps running server-side and this tool can be called as many
+    times as needed.
 
-    Args:
-        generation_id: Id returned by ``generate``.
-        timeout_s: Max seconds to wait; None uses the server default.
-
-    Returns:
-        On success the job-result shape: {"generation_id", "status",
-        "output_urls", "outputs", "model_id", "credits_spent",
-        "remaining_balance", "elapsed_s", "error"}. On failure:
-        {"error": {"code", "message", "details"}} with code
-        GENERATION_FAILED (details include the provider reason),
-        TIMEOUT_PENDING (details include generation_id and a resume hint),
-        NOT_FOUND, AUTH, or UPSTREAM_ERROR.
+    Returns the job-result shape {"generation_id", "status", "output_urls",
+    "outputs", "model_id", "credits_spent", "remaining_balance",
+    "elapsed_s", "error"}. On failure: {"error": {"code", "message",
+    "details"}} with code GENERATION_FAILED (details include the provider
+    reason), TIMEOUT_PENDING (details include generation_id and a resume
+    hint), NOT_FOUND, AUTH, or UPSTREAM_ERROR.
     """
+    generation_id = clean_id(generation_id)
     rt = get_runtime()
     started = time.monotonic()
     timeout = float(timeout_s if timeout_s is not None else rt.settings.default_timeout_s)

@@ -10,6 +10,10 @@ and the raw catalog is cached in the runtime TTL cache under the key
 
 from __future__ import annotations
 
+from typing import Annotated, Any
+
+from pydantic import Field
+
 from pixio_mcp.errors import tool_guard
 from pixio_mcp.runtime import get_runtime
 
@@ -18,6 +22,15 @@ _DESCRIPTION_MAX_CHARS = 200
 _LIMIT_MIN = 1
 _LIMIT_MAX = 200
 _QUERY_FIELDS = ("id", "name", "description")
+
+#: Characters LLM callers commonly wrap identifiers in (markdown backticks,
+#: stray whitespace) — stripped at tool entry per the v1.1 input-leniency rule.
+_IDENT_STRIP_CHARS = "` \t\r\n"
+
+
+def _strip_identifier(value: str) -> str:
+    """Strip surrounding whitespace and backticks from an id-like argument."""
+    return value.strip(_IDENT_STRIP_CHARS)
 
 
 async def get_cached_models() -> list[dict]:
@@ -42,28 +55,50 @@ async def get_cached_models() -> list[dict]:
 
 @tool_guard
 async def list_models(
-    type: str | None = None,
-    query: str | None = None,
-    limit: int = 50,
-    offset: int = 0,
-) -> dict:
+    type: Annotated[
+        str | None,
+        Field(
+            description=(
+                'Exact model type to match, e.g. "text-to-image", '
+                '"image-to-image", "image-to-video", "text-to-audio".'
+            )
+        ),
+    ] = None,
+    query: Annotated[
+        str | None,
+        Field(
+            description=(
+                "Case-insensitive substring matched over model id, name, and "
+                'description, e.g. "flux".'
+            )
+        ),
+    ] = None,
+    limit: Annotated[
+        int,
+        Field(
+            description=(
+                "Max models returned, clamped 1..200 (default 20); "
+                "small-context callers should filter with type/query, "
+                "not raise this."
+            )
+        ),
+    ] = 20,
+    offset: Annotated[
+        int,
+        Field(
+            description=(
+                "Number of matching models to skip, for pagination; "
+                "negative values are treated as 0."
+            )
+        ),
+    ] = 0,
+) -> dict[str, Any]:
     """Browse the Pixio model catalog (550+ models) with optional filters.
 
     Step 1 of the three-call contract for running any generation:
     1. list_models — find a model id (filter by type and/or query).
     2. get_model_params(model_id) — fetch that model's exact input schema.
     3. generate(model_id, params) — run the job.
-
-    Args:
-        type: Exact model type to match, e.g. "text-to-image",
-            "image-to-image", "image-to-video", "text-to-video",
-            "video-to-video", "text-to-audio".
-        query: Case-insensitive substring matched against each model's id,
-            name, and description (e.g. "flux", "background removal").
-        limit: Maximum number of models to return; clamped to 1..200
-            (default 50).
-        offset: Number of matching models to skip, for pagination
-            (negative values are treated as 0).
 
     Returns:
         {"models": [{"id", "name", "type", "credits", "company",
@@ -111,7 +146,12 @@ async def list_models(
 
 
 @tool_guard
-async def get_model_params(model_id: str) -> dict:
+async def get_model_params(
+    model_id: Annotated[
+        str,
+        Field(description='Model id from list_models, e.g. "pixio/flux-1/schnell".'),
+    ],
+) -> dict[str, Any]:
     """Fetch the exact input schema for one Pixio model.
 
     Step 2 of the three-call contract: list_models -> get_model_params ->
@@ -126,10 +166,6 @@ async def get_model_params(model_id: str) -> dict:
       gateway. On your first attempt send EVERY listed param, using each
       param's ``defaultValue`` where you have no better value.
 
-    Args:
-        model_id: Catalog model id from list_models,
-            e.g. "pixio/flux-1/schnell".
-
     Returns:
         The gateway /params response verbatim: {"model": {...}, "params":
         [{"name", "type", "label", "required", "defaultValue",
@@ -137,4 +173,4 @@ async def get_model_params(model_id: str) -> dict:
         An unknown model id yields a NOT_FOUND error dict.
     """
     rt = get_runtime()
-    return await rt.client.get_params(model_id)
+    return await rt.client.get_params(_strip_identifier(model_id))

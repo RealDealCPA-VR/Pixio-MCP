@@ -55,55 +55,128 @@ $env:PIXIO_API_KEY = "pxio_live_..."
 uv run pixio-mcp
 ```
 
+```sh
+# bash / zsh — same thing
+export PIXIO_API_KEY="pxio_live_..."
+uv run pixio-mcp
+```
+
 You'll almost never run it by hand — register it with your client (next section) and let your agent cook. 👨‍🍳 No key set? The server still boots (warning on stderr) and every tool politely returns an `AUTH` error until you feed it one.
 
 ## 🔌 Plug it in
 
-### Claude Desktop
+### 🌍 Any MCP host
 
-Edit `%APPDATA%\Claude\claude_desktop_config.json` (Windows) or `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS), add under `mcpServers`, restart Claude Desktop:
-
-**Local checkout** (run straight from this repo):
+One JSON shape rules them all:
 
 ```json
 {
   "mcpServers": {
     "pixio": {
       "command": "uv",
-      "args": ["run", "--directory", "C:\\Users\\VR\\projects\\Pixio-MCP", "pixio-mcp"],
+      "args": ["run", "--directory", "<path-to-repo>", "pixio-mcp"],
       "env": { "PIXIO_API_KEY": "pxio_live_..." }
     }
   }
 }
 ```
 
-**Published package** (once `pixio-mcp` hits PyPI — `uvx` fetches and runs in one move):
+This **exact block** works in **Claude Desktop**, **LM Studio** (`~/.lmstudio/mcp.json`), **Cursor** (`.cursor/mcp.json`), **Windsurf**, **Cline** (`cline_mcp_settings.json`), and **LibreChat** (`librechat.yaml`, `mcpServers` section). Swap `<path-to-repo>` for wherever you cloned this — and once `pixio-mcp` hits PyPI, swap the whole command for `"command": "uvx", "args": ["pixio-mcp"]`.
 
-```json
-{
-  "mcpServers": {
-    "pixio": {
-      "command": "uvx",
-      "args": ["pixio-mcp"],
-      "env": { "PIXIO_API_KEY": "pxio_live_..." }
-    }
-  }
-}
-```
+### Claude Desktop
+
+Drop the block above into `%APPDATA%\Claude\claude_desktop_config.json` (Windows) or `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) under `mcpServers`, restart Claude Desktop. Done.
 
 ### Claude Code
 
 One-liner. That's it. That's the setup.
 
 ```sh
-# Local checkout
-claude mcp add pixio -e PIXIO_API_KEY=pxio_live_... -- uv run --directory C:\Users\VR\projects\Pixio-MCP pixio-mcp
+# <path-to-repo> = your clone, e.g. C:\Users\you\projects\Pixio-MCP
+claude mcp add pixio -e PIXIO_API_KEY=pxio_live_... -- uv run --directory <path-to-repo> pixio-mcp
 
 # Published package
 claude mcp add pixio -e PIXIO_API_KEY=pxio_live_... -- uvx pixio-mcp
 ```
 
 Or drop the same JSON block into your project's `.mcp.json`.
+
+### Continue
+
+In `config.yaml`, add a stdio entry under `mcpServers`:
+
+```yaml
+mcpServers:
+  - name: pixio
+    command: uv
+    args: ["run", "--directory", "<path-to-repo>", "pixio-mcp"]
+    env:
+      PIXIO_API_KEY: pxio_live_...
+```
+
+### Zed
+
+In `settings.json`, under `context_servers`:
+
+```json
+{
+  "context_servers": {
+    "pixio": {
+      "command": {
+        "path": "uv",
+        "args": ["run", "--directory", "<path-to-repo>", "pixio-mcp"],
+        "env": { "PIXIO_API_KEY": "pxio_live_..." }
+      }
+    }
+  }
+}
+```
+
+### Open WebUI
+
+Open WebUI speaks OpenAPI, not MCP — bridge with [`mcpo`](https://github.com/open-webui/mcpo):
+
+```sh
+export PIXIO_API_KEY="pxio_live_..."
+uvx mcpo --port 8000 --api-key <secret> -- uvx pixio-mcp
+```
+
+Then add `http://localhost:8000` as an **OpenAPI tool server** in Open WebUI (Settings → Tools), using `<secret>` as the bearer token.
+
+### 🐍 Roll your own agent
+
+No host at all? The vanilla [`mcp`](https://pypi.org/project/mcp/) SDK gets you a working client in ~15 lines:
+
+```python
+import asyncio
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
+
+async def main() -> None:
+    server = StdioServerParameters(
+        command="uv",
+        args=["run", "--directory", "<path-to-repo>", "pixio-mcp"],
+        env={"PIXIO_API_KEY": "pxio_live_..."},
+    )
+    async with stdio_client(server) as (read, write):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            tools = await session.list_tools()
+            print([t.name for t in tools.tools])
+            result = await session.call_tool("list_models", {"query": "flux", "limit": 5})
+            print(result.content[0].text)
+
+asyncio.run(main())
+```
+
+## 🏠 Built for local models too
+
+This server isn't just tuned for frontier models — it's deliberately friendly to a 7B running on your laptop:
+
+- **Self-describing schemas.** Every tool parameter carries its own description in the MCP schema — small models don't have to guess what `confirm` or `offset` mean.
+- **Lenient inputs.** String numbers, string bools, `params` passed as a JSON *string*, backtick-wrapped ids — all quietly normalized instead of rejected. Local models fumble formats; the server doesn't punish them for it.
+- **Compact by default.** `list_models` returns 20 models per call unless you ask for more, and descriptions are truncated — a 554-model catalog never floods a small context window. Filter with `type`/`query` instead of paging.
+- **HTTP transport built in.** LM Studio, Ollama-backed hosts, or anything that prefers HTTP over stdio — see [Transports](#-transports) below.
 
 ## 🎛️ Configuration
 
@@ -118,14 +191,28 @@ Everything tunes through env vars:
 | `PIXIO_DEFAULT_TIMEOUT_S` | no | `180` | Default wait for `generate(wait=true)` / `wait_for_generation`. |
 | `PIXIO_DOWNLOAD_DIR` | no | `~/pixio-outputs` | Where `download_output` drops the goods. |
 | `PIXIO_LOG_LEVEL` | no | `INFO` | Logs go to **stderr** as JSON lines (stdout carries the MCP protocol). |
+| `PIXIO_TRANSPORT` | no | `stdio` | `stdio`, `streamable-http`, or `sse`. See [Transports](#-transports). |
+| `PIXIO_HOST` | no | `127.0.0.1` | Bind address for the HTTP transports. |
+| `PIXIO_PORT` | no | `8000` | Bind port for the HTTP transports. |
 
-Fat-finger an integer (`PIXIO_SESSION_BUDGET=lots`)? Instant `VALIDATION` error naming the exact variable. No silent misconfigs.
+Fat-finger an integer (`PIXIO_SESSION_BUDGET=lots`)? The server **refuses to boot** — one clean stderr line naming the exact variable, no traceback. No silent misconfigs.
+
+## 🚦 Transports
+
+Default is **stdio** — the classic spawn-me-as-a-subprocess mode every desktop host uses. For hosts that talk HTTP instead (web UIs, remote agents, LM Studio-style local stacks), flip one env var:
+
+```sh
+export PIXIO_TRANSPORT=streamable-http   # or "sse" for legacy SSE hosts
+uv run pixio-mcp                          # serves on http://127.0.0.1:8000
+```
+
+**⚠️ SECURITY: this server holds a spending API key.** Anyone who can reach the port can burn your credits. Keep it bound to `127.0.0.1` (the default) — if you must expose it beyond localhost via `PIXIO_HOST`, put it behind a reverse proxy with auth, a firewall rule, or a VPN. Never bind `0.0.0.0` on an untrusted network.
 
 ## 🧰 The toolkit — 9 tools, full lifecycle
 
 | Tool | What it does | Key inputs |
 |---|---|---|
-| `list_models` | Filterable catalog of all 554+ models (cached 10 min). Id, name, type, per-run credits, company, description. | `type` (exact, e.g. `"text-to-image"`), `query` (substring), `limit` (1–200), `offset` |
+| `list_models` | Filterable catalog of all 554+ models (cached 10 min). Id, name, type, per-run credits, company, description. | `type` (exact, e.g. `"text-to-image"`), `query` (substring), `limit` (1–200, default **20**), `offset` |
 | `get_model_params` | The **exact** live input schema for one model — names, types, required flags, defaults, allowed `options`. Verbatim API passthrough. | `model_id` |
 | `estimate_cost` | Price the job **before** a single credit moves. Falls back to catalog cost if the estimate endpoint flakes. | `model_id`, `params` |
 | `upload_media` | Local file **or** remote URL → permanent public Pixio URL (`pixiomedia.nyc3.digitaloceanspaces.com`). | `source` |
@@ -188,8 +275,8 @@ Add **`download_output`** and a text prompt becomes a file on your machine in **
 >>> download_output(generation_id="b7e2f9c1-4a06-4d2e-9c1e-0f3a7d5e8b21")
 {
   "generation_id": "b7e2f9c1-4a06-4d2e-9c1e-0f3a7d5e8b21",
-  "files": ["C:\\Users\\VR\\pixio-outputs\\b7e2f9c1-0.png"],
-  "dest_dir": "C:\\Users\\VR\\pixio-outputs"
+  "files": ["~/pixio-outputs/b7e2f9c1-0.png"],
+  "dest_dir": "~/pixio-outputs"
 }
 ```
 

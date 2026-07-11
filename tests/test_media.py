@@ -1,23 +1,27 @@
 """Offline tests for ``tools/media.py``.
 
 Covers ``upload_media`` (remote-URL JSON mirror vs local-file multipart, plus
-VALIDATION for missing paths and directories) and ``download_output`` (files
-written with the pinned naming scheme and PNG magic bytes, VALIDATION on any
-non-succeeded status — processing points at wait_for_generation, failed
-carries the provider reason — traversal-safe filenames, and dest_dir
-defaulting to settings.download_dir).
+VALIDATION for missing paths, directories, and data: URLs) and
+``download_output`` (files written with the pinned naming scheme and PNG magic
+bytes, VALIDATION on any non-succeeded status — processing points at
+wait_for_generation, failed carries the provider reason — traversal-safe
+filenames, dest_dir defaulting to settings.download_dir, VALIDATION for an
+un-creatable dest_dir, generation_id whitespace/backtick stripping, and the
+v1.1 requirement that every tool parameter carries a Field description).
 
 All tests run against the ``MockAPI`` transport from conftest — no network.
 """
 
 from __future__ import annotations
 
+import inspect
 import json
 from pathlib import Path
 from typing import Any
 
 import httpx
 import pytest
+from pydantic.fields import FieldInfo
 
 from conftest import MockAPI
 from pixio_mcp.config import Settings
@@ -26,6 +30,24 @@ from pixio_mcp.tools.media import download_output, upload_media
 
 PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 UPLOADED_URL = "https://pixiomedia.nyc3.digitaloceanspaces.com/uploads/test.png"
+
+
+def _field_descriptions(func: Any) -> dict[str, str | None]:
+    """Map each parameter of a tool to its pydantic Field description (or None).
+
+    ``inspect.signature`` follows ``__wrapped__`` through the ``tool_guard``
+    decorator, and ``eval_str=True`` resolves the PEP-563 string annotations in
+    the tool module's globals — exactly how FastMCP builds the input schema.
+    """
+    sig = inspect.signature(func, eval_str=True)
+    descriptions: dict[str, str | None] = {}
+    for name, param in sig.parameters.items():
+        description: str | None = None
+        for meta in getattr(param.annotation, "__metadata__", ()):
+            if isinstance(meta, FieldInfo) and meta.description:
+                description = meta.description
+        descriptions[name] = description
+    return descriptions
 
 
 def _media_requests(mock_api: MockAPI) -> list[httpx.Request]:
@@ -237,3 +259,110 @@ async def test_download_output_defaults_to_settings_download_dir(
     written = Path(result["files"][0])
     assert written.parent.resolve() == settings.download_dir.resolve()
     assert written.read_bytes()[:8] == PNG_MAGIC
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "data:image/png;base64,iVBORw0KGgoAAAANSUhEUg==",
+        "DATA:image/png;base64,iVBORw0KGgoAAAANSUhEUg==",
+        "  data:text/plain,hello",
+    ],
+)
+async def test_upload_media_data_url_is_validation(
+    runtime: Runtime, mock_api: MockAPI, source: str
+) -> None:
+    """v1.1 addendum #7: data: URLs are rejected with guidance, no upload made."""
+    result = await upload_media(source)
+
+    assert result["error"]["code"] == "VALIDATION"
+    message = result["error"]["message"]
+    assert "data:" in message
+    assert "directly" in message
+    assert "http" in message
+    assert _media_requests(mock_api) == []
+
+
+async def test_download_output_dest_dir_occupied_by_file_is_validation(
+    runtime: Runtime, mock_api: MockAPI, tmp_path: Path
+) -> None:
+    """v1.1 addendum #7: a dest_dir that exists as a FILE maps to VALIDATION."""
+    occupied = tmp_path / "not-a-dir"
+    occupied.write_bytes(b"occupied")
+
+    result = await download_output("gen-123", dest_dir=str(occupied))
+
+    assert result["error"]["code"] == "VALIDATION"
+    assert "dest_dir" in result["error"]["message"]
+    assert result["error"]["details"]["dest_dir"] == str(occupied)
+    assert _cdn_requests(mock_api) == []
+
+
+async def test_download_output_dest_dir_under_file_is_validation(
+    runtime: Runtime, mock_api: MockAPI, tmp_path: Path
+) -> None:
+    """v1.1 addendum #7: mkdir OSError (parent is a file) maps to VALIDATION."""
+    blocker = tmp_path / "blocker"
+    blocker.write_bytes(b"file, not dir")
+
+    result = await download_output("gen-123", dest_dir=str(blocker / "child"))
+
+    assert result["error"]["code"] == "VALIDATION"
+    assert "dest_dir" in result["error"]["message"]
+    assert _cdn_requests(mock_api) == []
+
+
+async def test_download_output_strips_whitespace_and_backticks(
+    runtime: Runtime, mock_api: MockAPI, tmp_path: Path
+) -> None:
+    """v1.1 addendum #3: generation_id is stripped of whitespace and backticks."""
+    dest = tmp_path / "dl"
+
+    result = await download_output("\t `gen-123` \n", dest_dir=str(dest))
+
+    assert "error" not in result
+    assert result["generation_id"] == "gen-123"
+    assert len(result["files"]) == 1
+    assert Path(result["files"][0]).name == "gen-123-0.png"
+
+    generation_requests = [
+        req for req in mock_api.requests if "/generations/" in req.url.path
+    ]
+    assert len(generation_requests) == 1
+    assert generation_requests[0].url.path.endswith("/generations/gen-123")
+
+
+def test_every_media_tool_parameter_has_field_description() -> None:
+    """v1.1 addendum #1: every parameter carries a short Field description."""
+    for tool in (upload_media, download_output):
+        descriptions = _field_descriptions(tool)
+        assert descriptions, f"{tool.__name__} has no parameters to describe?"
+        for name, description in descriptions.items():
+            assert description, f"{tool.__name__}({name}) is missing a Field description"
+            assert len(description) <= 120, (
+                f"{tool.__name__}({name}) description exceeds 120 chars"
+            )
+
+    # source explains the data:-URL and local-path handling.
+    source_description = _field_descriptions(upload_media)["source"]
+    assert source_description is not None
+    assert "data:" in source_description
+
+    # dest_dir names the env default.
+    dest_dir_description = _field_descriptions(download_output)["dest_dir"]
+    assert dest_dir_description is not None
+    assert "PIXIO_DOWNLOAD_DIR" in dest_dir_description
+
+
+def test_media_tools_annotate_dict_str_any_return() -> None:
+    """v1.1 addendum #4: tools declare -> dict[str, Any] uniformly."""
+    for tool in (upload_media, download_output):
+        sig = inspect.signature(tool, eval_str=True)
+        assert sig.return_annotation == dict[str, Any], tool.__name__
+
+
+def test_media_docstrings_have_no_args_section() -> None:
+    """v1.1 addendum #4: Args: sections are gone (Field descriptions replace them)."""
+    for tool in (upload_media, download_output):
+        doc = inspect.getdoc(tool) or ""
+        assert "Args:" not in doc, tool.__name__

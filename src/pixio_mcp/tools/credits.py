@@ -2,13 +2,18 @@
 
 Also exposes :func:`resolve_estimate`, the shared estimate -> catalog-cost ->
 unknown fallback chain used by both ``estimate_cost`` and
-``pixio_mcp.tools.generation`` for pre-spend budget checks. The catalog
+``pixio_mcp.tools.generation`` for pre-spend budget checks, plus the shared
+input-leniency helpers :func:`clean_id` and :func:`coerce_params`. The catalog
 fallback reads the same TTL-cached catalog snapshot the catalog tools use.
 """
 
 from __future__ import annotations
 
+import json
 import logging
+from typing import Annotated, Any
+
+from pydantic import Field
 
 from pixio_mcp.errors import ErrorCode, PixioError, tool_guard
 from pixio_mcp.runtime import get_runtime
@@ -21,6 +26,54 @@ _NO_FALLBACK_CODES = frozenset({ErrorCode.AUTH, ErrorCode.INSUFFICIENT_CREDITS})
 SOURCE_ESTIMATE = "estimate"
 SOURCE_CATALOG = "catalog"
 SOURCE_UNKNOWN = "unknown"
+
+#: Characters stripped from id-like tool arguments (LLM callers frequently
+#: wrap ids in markdown backticks and stray whitespace).
+_ID_STRIP_CHARS = "` \t\r\n"
+
+#: Exact VALIDATION message for a non-object ``params`` argument (contract
+#: v1.1 addendum #3).
+PARAMS_TYPE_MESSAGE = "params must be a JSON object mapping parameter names to values"
+
+
+def clean_id(value: str) -> str:
+    """Strip surrounding whitespace and markdown backticks from an id.
+
+    Input leniency for ``model_id`` / ``generation_id`` tool arguments:
+    ``' \\`pixio/flux-1/schnell\\` '`` -> ``'pixio/flux-1/schnell'``.
+    Non-string values pass through unchanged (they fail later validation).
+    """
+    if not isinstance(value, str):
+        return value
+    return value.strip(_ID_STRIP_CHARS)
+
+
+def coerce_params(params: dict[str, Any] | str) -> dict[str, Any]:
+    """Normalize a tool ``params`` argument to a plain dict.
+
+    A JSON-encoded string is ``json.loads``-unwrapped up to two times (some
+    LLM callers double-encode tool arguments). Anything that does not resolve
+    to a JSON object raises ``PixioError(VALIDATION)`` with
+    :data:`PARAMS_TYPE_MESSAGE`.
+    """
+    value: Any = params
+    for _ in range(2):
+        if not isinstance(value, str):
+            break
+        try:
+            value = json.loads(value)
+        except ValueError:
+            break  # not JSON at all -> falls through to the type check below
+    if not isinstance(value, dict):
+        raise PixioError(
+            ErrorCode.VALIDATION,
+            PARAMS_TYPE_MESSAGE,
+            details={
+                "received_type": type(params).__name__,
+                "resolved_type": type(value).__name__,
+            },
+        )
+    return value
 
 
 def _coerce_credits(value: object) -> int | None:
@@ -35,7 +88,7 @@ def _coerce_credits(value: object) -> int | None:
 
 
 async def resolve_estimate(
-    model_id: str, params: dict
+    model_id: str, params: dict[str, Any]
 ) -> tuple[int | None, str, str | None]:
     """Resolve a credit estimate for a job via the standard fallback chain.
 
@@ -44,19 +97,25 @@ async def resolve_estimate(
     ("unknown", with a human-readable warning). Shared by the estimate_cost
     tool and by generate()'s pre-spend budget check.
 
-    Args:
-        model_id: Catalog model id, e.g. "pixio/flux-1/schnell".
-        params: The exact params object intended for generate().
+    An ``estimatedCost`` of 0 is NOT treated as a usable estimate (the live
+    gateway returns 0 for models it cannot price, which would bypass the
+    budget caps) — it falls through to the catalog cost:
 
-    Returns:
-        ``(estimated_credits, source, warning)`` where ``source`` is one of
-        "estimate", "catalog", or "unknown"; ``estimated_credits`` is None and
-        ``warning`` is a non-None string only when ``source`` is "unknown".
+    - estimate 0 + catalog cost > 0 -> ``(catalog_cost, "catalog", warning)``
+      (warning notes the 0 estimate was discarded);
+    - estimate 0 + catalog cost == 0 -> ``(0, "catalog", None)`` (genuinely
+      free, e.g. video-ops models);
+    - estimate 0 + catalog unknown -> ``(None, "unknown", warning)``.
+
+    Returns ``(estimated_credits, source, warning)`` where ``source`` is one
+    of "estimate", "catalog", or "unknown"; ``estimated_credits`` is None
+    exactly when ``source`` is "unknown".
 
     Raises:
         PixioError: with code AUTH or INSUFFICIENT_CREDITS from the estimate
             endpoint — those are never swallowed by the fallback chain.
     """
+    estimate_was_zero = False
     estimate_failure: str
     try:
         payload = await get_runtime().client.estimate(model_id, params)
@@ -67,9 +126,15 @@ async def resolve_estimate(
     else:
         raw_cost = payload.get("estimatedCost")
         estimated = _coerce_credits(raw_cost)
-        if estimated is not None:
+        if estimated is not None and estimated > 0:
             return estimated, SOURCE_ESTIMATE, None
-        estimate_failure = f"response had no usable estimatedCost ({raw_cost!r})"
+        if estimated == 0:
+            estimate_was_zero = True
+            estimate_failure = (
+                "returned estimatedCost 0, which is not a usable estimate"
+            )
+        else:
+            estimate_failure = f"response had no usable estimatedCost ({raw_cost!r})"
 
     catalog_failure: str
     try:
@@ -85,6 +150,17 @@ async def resolve_estimate(
                         "estimate fell back to catalog cost",
                         extra={"model_id": model_id, "credits": listed},
                     )
+                    if estimate_was_zero and listed > 0:
+                        return (
+                            listed,
+                            SOURCE_CATALOG,
+                            (
+                                f"The estimate endpoint reported 0 credits for "
+                                f"{model_id!r}, which is not a usable estimate; "
+                                f"using the catalog-listed cost of {listed} "
+                                f"credits instead."
+                            ),
+                        )
                     return listed, SOURCE_CATALOG, None
                 catalog_failure = "catalog entry has no usable credits value"
                 break
@@ -103,29 +179,40 @@ async def resolve_estimate(
 
 
 @tool_guard
-async def estimate_cost(model_id: str, params: dict) -> dict:
+async def estimate_cost(
+    model_id: Annotated[
+        str,
+        Field(description='Model id from list_models, e.g. "pixio/flux-1/schnell".'),
+    ],
+    params: Annotated[
+        dict[str, Any] | str,
+        Field(
+            description=(
+                "Exact params object intended for generate, built from "
+                "get_model_params. JSON object; JSON string accepted."
+            )
+        ),
+    ],
+) -> dict[str, Any]:
     """Estimate the credit cost of a generation BEFORE spending anything.
 
     Call this after get_model_params and before generate (the three-call
     contract is list_models -> get_model_params -> generate; this tool is the
-    recommended pre-flight between steps 2 and 3). Costs come from the gateway
-    estimate endpoint when available ("source": "estimate"), else from the
-    catalog-listed per-generation cost ("source": "catalog"), else the cost is
-    reported as unknown.
+    recommended pre-flight between steps 2 and 3). The cost comes from the
+    gateway estimate endpoint when it returns a positive figure
+    ("source": "estimate"), else from the catalog-listed per-generation cost
+    ("source": "catalog"), else it is reported as unknown.
 
-    Args:
-        model_id: Catalog model id, e.g. "pixio/flux-1/schnell".
-        params: The exact params object you intend to pass to generate(),
-            built from the get_model_params response.
-
-    Returns:
-        {"model_id": str, "estimated_credits": int | null, "source":
-        "estimate" | "catalog" | "unknown"}, plus a "warning" string only when
-        the cost could not be determined ("estimated_credits" is null and
-        "source" is "unknown").
+    Returns {"model_id": str, "estimated_credits": int | null, "source":
+    "estimate" | "catalog" | "unknown"}, plus a "warning" string when the
+    cost is uncertain (always present when "source" is "unknown").
     """
-    estimated_credits, source, warning = await resolve_estimate(model_id, params)
-    result: dict = {
+    model_id = clean_id(model_id)
+    parsed_params = coerce_params(params)
+    estimated_credits, source, warning = await resolve_estimate(
+        model_id, parsed_params
+    )
+    result: dict[str, Any] = {
         "model_id": model_id,
         "estimated_credits": estimated_credits,
         "source": source,
@@ -137,8 +224,25 @@ async def estimate_cost(model_id: str, params: dict) -> dict:
 
 @tool_guard
 async def get_credits(
-    include_ledger_tail: bool = False, ledger_limit: int = 10
-) -> dict:
+    include_ledger_tail: Annotated[
+        bool,
+        Field(
+            description=(
+                "Set true to also return recent credit ledger entries "
+                "(spend and top-up history)."
+            )
+        ),
+    ] = False,
+    ledger_limit: Annotated[
+        int,
+        Field(
+            description=(
+                "Max ledger entries to return (default 10); used only when "
+                "include_ledger_tail is true."
+            )
+        ),
+    ] = 10,
+) -> dict[str, Any]:
     """Report the Pixio account's current credit balance.
 
     Use to check affordability before a job or to audit spend after one.
@@ -146,22 +250,14 @@ async def get_credits(
     "remaining_balance", so this tool is mainly for standalone balance checks
     and recent-spend review.
 
-    Args:
-        include_ledger_tail: When true, also return the most recent credit
-            ledger entries (spend and top-up history).
-        ledger_limit: Maximum ledger entries to include (default 10; only
-            used when include_ledger_tail is true; negative values are
-            treated as 0).
-
-    Returns:
-        {"total": <spendable credits>, "recurring": {"current", "quota",
-        "lastTopOffAt"}, "permanent": <non-expiring credits>}, plus
-        "ledger_tail": [{"id", "reason", "deltaRecurring", "deltaPermanent",
-        "sourceId", "createdAt"}, ...] when include_ledger_tail is true.
+    Returns {"total": <spendable credits>, "recurring": {"current", "quota",
+    "lastTopOffAt"}, "permanent": <non-expiring credits>}, plus
+    "ledger_tail": [{"id", "reason", "deltaRecurring", "deltaPermanent",
+    "sourceId", "createdAt"}, ...] when include_ledger_tail is true.
     """
     rt = get_runtime()
     balance = await rt.client.get_credits()
-    result: dict = {
+    result: dict[str, Any] = {
         "total": balance.get("total"),
         "recurring": balance.get("recurring"),
         "permanent": balance.get("permanent"),

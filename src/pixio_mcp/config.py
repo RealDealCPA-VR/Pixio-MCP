@@ -19,13 +19,20 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, cast
 
 from pixio_mcp.errors import ErrorCode, PixioError
+
+#: Transport names FastMCP's ``run()`` accepts (matches its own Literal type).
+Transport = Literal["stdio", "sse", "streamable-http"]
 
 _DEFAULT_BASE_URL = "https://beta.pixio.myapps.ai/api/v1"
 _DEFAULT_DOWNLOAD_DIR = "~/pixio-outputs"
 _API_SUFFIX = "/api/v1"
+
+#: The allowed PIXIO_TRANSPORT values, in the order they are reported in
+#: validation errors.
+ALLOWED_TRANSPORTS: tuple[Transport, ...] = ("stdio", "sse", "streamable-http")
 
 
 def _normalize_base_url(raw: str) -> str:
@@ -60,6 +67,32 @@ def _int_env(src: Mapping[str, str], name: str, default: int) -> int:
         ) from None
 
 
+def _transport_env(src: Mapping[str, str], name: str, default: Transport) -> Transport:
+    """Parse a transport env var; unset/blank → *default*.
+
+    Raises:
+        PixioError: :data:`ErrorCode.VALIDATION` naming the env var and the
+            allowed values when the value is not one of
+            :data:`ALLOWED_TRANSPORTS`.
+    """
+    raw = src.get(name)
+    if raw is None or not raw.strip():
+        return default
+    value = raw.strip()
+    if value not in ALLOWED_TRANSPORTS:
+        allowed = ", ".join(repr(t) for t in ALLOWED_TRANSPORTS)
+        raise PixioError(
+            ErrorCode.VALIDATION,
+            f"Environment variable {name} must be one of {allowed}, got {value!r}.",
+            details={
+                "env_var": name,
+                "value": value,
+                "allowed": list(ALLOWED_TRANSPORTS),
+            },
+        )
+    return cast(Transport, value)
+
+
 @dataclass
 class Settings:
     """Runtime configuration for the pixio-mcp server.
@@ -75,6 +108,9 @@ class Settings:
     default_timeout_s: int = 180
     download_dir: Path = Path(_DEFAULT_DOWNLOAD_DIR)
     log_level: str = "INFO"
+    transport: Transport = "stdio"
+    host: str = "127.0.0.1"
+    port: int = 8000
 
     def __post_init__(self) -> None:
         """Normalize ``base_url`` and expand ``~`` in ``download_dir``."""
@@ -95,7 +131,10 @@ class Settings:
             f"session_budget={self.session_budget}, "
             f"default_timeout_s={self.default_timeout_s}, "
             f"download_dir={str(self.download_dir)!r}, "
-            f"log_level={self.log_level!r})"
+            f"log_level={self.log_level!r}, "
+            f"transport={self.transport!r}, "
+            f"host={self.host!r}, "
+            f"port={self.port})"
         )
 
     @classmethod
@@ -105,11 +144,14 @@ class Settings:
         Recognized variables: ``PIXIO_API_KEY``, ``PIXIO_BASE_URL``,
         ``PIXIO_MAX_CREDITS_PER_JOB``, ``PIXIO_SESSION_BUDGET``,
         ``PIXIO_DEFAULT_TIMEOUT_S``, ``PIXIO_DOWNLOAD_DIR``,
-        ``PIXIO_LOG_LEVEL``. Unset or blank values fall back to defaults.
+        ``PIXIO_LOG_LEVEL``, ``PIXIO_TRANSPORT``, ``PIXIO_HOST``,
+        ``PIXIO_PORT``. Unset or blank values fall back to defaults.
 
         Raises:
             PixioError: :data:`ErrorCode.VALIDATION` naming the env var when
-                an integer variable holds a non-integer value.
+                an integer variable holds a non-integer value or
+                ``PIXIO_TRANSPORT`` is not one of
+                :data:`ALLOWED_TRANSPORTS`.
         """
         src: Mapping[str, str] = os.environ if env is None else env
         return cls(
@@ -122,6 +164,9 @@ class Settings:
                 (src.get("PIXIO_DOWNLOAD_DIR") or _DEFAULT_DOWNLOAD_DIR).strip()
             ),
             log_level=(src.get("PIXIO_LOG_LEVEL") or "INFO").strip() or "INFO",
+            transport=_transport_env(src, "PIXIO_TRANSPORT", "stdio"),
+            host=(src.get("PIXIO_HOST") or "").strip() or "127.0.0.1",
+            port=_int_env(src, "PIXIO_PORT", 8000),
         )
 
 

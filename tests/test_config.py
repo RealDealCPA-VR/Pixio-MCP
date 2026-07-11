@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from conftest import TEST_KEY
-from pixio_mcp.config import Settings, setup_logging
+from pixio_mcp.config import ALLOWED_TRANSPORTS, Settings, setup_logging
 from pixio_mcp.errors import ErrorCode, PixioError
 
 DEFAULT_BASE_URL = "https://beta.pixio.myapps.ai/api/v1"
@@ -23,6 +23,9 @@ def test_defaults_with_empty_env() -> None:
     assert settings.default_timeout_s == 180
     assert settings.download_dir == Path("~/pixio-outputs").expanduser()
     assert settings.log_level == "INFO"
+    assert settings.transport == "stdio"
+    assert settings.host == "127.0.0.1"
+    assert settings.port == 8000
 
 
 def test_every_env_override(tmp_path: Path) -> None:
@@ -36,6 +39,9 @@ def test_every_env_override(tmp_path: Path) -> None:
             "PIXIO_DEFAULT_TIMEOUT_S": "30",
             "PIXIO_DOWNLOAD_DIR": str(download_dir),
             "PIXIO_LOG_LEVEL": "DEBUG",
+            "PIXIO_TRANSPORT": "streamable-http",
+            "PIXIO_HOST": "0.0.0.0",
+            "PIXIO_PORT": "9999",
         }
     )
     assert settings.api_key == TEST_KEY
@@ -45,6 +51,9 @@ def test_every_env_override(tmp_path: Path) -> None:
     assert settings.default_timeout_s == 30
     assert settings.download_dir == download_dir
     assert settings.log_level == "DEBUG"
+    assert settings.transport == "streamable-http"
+    assert settings.host == "0.0.0.0"
+    assert settings.port == 9999
 
 
 @pytest.mark.parametrize(
@@ -53,6 +62,7 @@ def test_every_env_override(tmp_path: Path) -> None:
         "PIXIO_MAX_CREDITS_PER_JOB",
         "PIXIO_SESSION_BUDGET",
         "PIXIO_DEFAULT_TIMEOUT_S",
+        "PIXIO_PORT",
     ],
 )
 def test_invalid_int_env_raises_validation_naming_the_var(var: str) -> None:
@@ -62,6 +72,59 @@ def test_invalid_int_env_raises_validation_naming_the_var(var: str) -> None:
     err = excinfo.value
     assert err.code == ErrorCode.VALIDATION
     assert var in err.to_dict()["error"]["message"]
+
+
+@pytest.mark.parametrize("transport", list(ALLOWED_TRANSPORTS))
+def test_every_allowed_transport_accepted(transport: str) -> None:
+    settings = Settings.from_env(
+        env={"PIXIO_API_KEY": TEST_KEY, "PIXIO_TRANSPORT": transport}
+    )
+    assert settings.transport == transport
+
+
+def test_blank_transport_falls_back_to_stdio() -> None:
+    settings = Settings.from_env(
+        env={"PIXIO_API_KEY": TEST_KEY, "PIXIO_TRANSPORT": "  "}
+    )
+    assert settings.transport == "stdio"
+
+
+def test_invalid_transport_raises_validation_naming_var_and_allowed_values() -> None:
+    with pytest.raises(PixioError) as excinfo:
+        Settings.from_env(
+            env={"PIXIO_API_KEY": TEST_KEY, "PIXIO_TRANSPORT": "websocket"}
+        )
+    err = excinfo.value
+    assert err.code == ErrorCode.VALIDATION
+    message = err.to_dict()["error"]["message"]
+    assert "PIXIO_TRANSPORT" in message
+    for allowed in ALLOWED_TRANSPORTS:
+        assert allowed in message
+    assert err.details["allowed"] == list(ALLOWED_TRANSPORTS)
+
+
+def test_invalid_port_raises_validation_naming_var() -> None:
+    with pytest.raises(PixioError) as excinfo:
+        Settings.from_env(env={"PIXIO_API_KEY": TEST_KEY, "PIXIO_PORT": "eight-k"})
+    err = excinfo.value
+    assert err.code == ErrorCode.VALIDATION
+    assert "PIXIO_PORT" in err.to_dict()["error"]["message"]
+
+
+def test_host_default_and_override() -> None:
+    assert Settings.from_env(env={}).host == "127.0.0.1"
+    settings = Settings.from_env(
+        env={"PIXIO_API_KEY": TEST_KEY, "PIXIO_HOST": "192.168.1.50"}
+    )
+    assert settings.host == "192.168.1.50"
+
+
+def test_positional_construction_still_works_without_new_fields() -> None:
+    # Fixtures build Settings positionally; the new fields must all default.
+    settings = Settings(TEST_KEY)
+    assert settings.transport == "stdio"
+    assert settings.host == "127.0.0.1"
+    assert settings.port == 8000
 
 
 @pytest.mark.parametrize(

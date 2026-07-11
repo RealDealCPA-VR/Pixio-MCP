@@ -12,7 +12,8 @@ retry up to 3 times on httpx transport errors and 5xx responses (backoff
 0.5s / 1s / 2s); uploads retry once, on connect errors only.
 
 Secrets hygiene: the API key is attached per request, is never logged, is
-never embedded in error messages, and is only ever sent to Pixio hosts —
+never embedded in error messages, and is only ever sent to Pixio hosts or the
+configured ``base_url`` host (covers localhost / LAN gateway overrides) —
 output downloads from third-party hosts (CDNs / DigitalOcean Spaces) carry no
 Authorization header.
 """
@@ -229,14 +230,17 @@ class PixioClient:
         """Stream ``url`` to ``dest`` atomically and return the bytes written.
 
         Follows redirects.  The Authorization header is sent ONLY when the URL
-        host is ``pixio.myapps.ai`` (or a subdomain) — generation outputs live
-        on DigitalOcean Spaces / CDNs and must never see the bearer token.
-        The file is written to a temp path in the destination directory and
-        renamed into place, so a failed transfer never leaves a partial
-        ``dest`` behind.
+        host is ``pixio.myapps.ai`` (or a subdomain) or equals the configured
+        ``base_url`` host (so a ``PIXIO_BASE_URL`` localhost/LAN gateway gets
+        authenticated downloads) — generation outputs live on DigitalOcean
+        Spaces / CDNs and must never see the bearer token.  httpx drops the
+        header on any cross-host redirect, so a redirecting gateway still
+        cannot leak the token to a third party.  The file is written to a
+        temp path in the destination directory and renamed into place, so a
+        failed transfer never leaves a partial ``dest`` behind.
         """
         headers: dict[str, str] = {}
-        if _is_pixio_host(url):
+        if self._is_authorized_download_host(url):
             self._require_key()
             headers["Authorization"] = f"Bearer {self._settings.api_key}"
 
@@ -354,6 +358,20 @@ class PixioClient:
         if not self._settings.api_key:
             raise PixioError(ErrorCode.AUTH, "PIXIO_API_KEY is not set")
 
+    def _is_authorized_download_host(self, url: str) -> bool:
+        """Return True when a download to ``url`` may carry the bearer token.
+
+        Allowed: ``pixio.myapps.ai`` (or a subdomain), or a host equal to the
+        configured ``base_url`` host — covers ``PIXIO_BASE_URL`` localhost/LAN
+        gateway overrides.  Anything else (third-party CDNs, DigitalOcean
+        Spaces) never sees the token.
+        """
+        if _is_pixio_host(url):
+            return True
+        host = (urlsplit(url).hostname or "").lower()
+        base_host = (urlsplit(self._settings.base_url).hostname or "").lower()
+        return bool(base_host) and host == base_host
+
     # ------------------------------------------------------------------ #
     # Response handling
     # ------------------------------------------------------------------ #
@@ -361,6 +379,8 @@ class PixioClient:
     def _raise_for_response(self, response: httpx.Response) -> None:
         """Central HTTP -> :class:`PixioError` mapping; no-op on 2xx.
 
+        3xx -> UPSTREAM_ERROR with ``details={"location": ...}`` (a gateway
+        redirect means PIXIO_BASE_URL points at the wrong URL);
         401 -> AUTH; 402 -> INSUFFICIENT_CREDITS (+credit details);
         404 or a body mentioning "model not found" -> NOT_FOUND;
         429 or a body mentioning "concurrency limit" -> CONCURRENCY
@@ -371,6 +391,16 @@ class PixioClient:
         if response.is_success:
             return
         status = response.status_code
+        if 300 <= status < 400:
+            raw_location = response.headers.get("location")
+            location = self._sanitize(raw_location) if raw_location else None
+            suffix = f" (Location: {location})" if location else ""
+            raise PixioError(
+                ErrorCode.UPSTREAM_ERROR,
+                f"the gateway redirected the request (HTTP {status}); "
+                f"set PIXIO_BASE_URL to the final URL{suffix}",
+                details={"location": location},
+            )
         try:
             body: Any = response.json()
         except Exception:
