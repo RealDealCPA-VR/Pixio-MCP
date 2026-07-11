@@ -142,10 +142,14 @@ class BudgetGuard:
     # raises PixioError(BUDGET_EXCEEDED) if estimated > max_per_job OR session_spent + estimated > session_budget,
     # UNLESS confirm=True. Message must state: the estimate, which cap was hit, cap value, and
     # "pass confirm=true to override". details={"estimated_credits","per_job_cap","session_budget","session_spent"}.
-    def record(self, actual: int) -> None    # adds to session_spent (never negative)
+    def record_submit(self, generation_id: str, estimated: int) -> None
+    # adds estimated to session_spent and remembers the per-id amount
+    def record_actual(self, generation_id: str, actual: int) -> None
+    # reconciles: session_spent += (actual - previously recorded for this id); updates per-id amount.
+    # Unknown id → += actual. Idempotent: calling twice with the same actual changes nothing.
 ```
 
-`check` with `confirm=True` never raises. Both caps checked; report whichever tripped (per-job first).
+`check` with `confirm=True` never raises. Both caps checked; report whichever tripped (per-job first). Spent totals clamp at >= 0.
 
 ## TTL cache — `cache.py` (B3)
 
@@ -186,6 +190,7 @@ All tools return dicts. Common job-result shape (from `generate`, `wait_for_gene
 
 ### tools/credits.py (B4)
 - `estimate_cost(model_id: str, params: dict) -> dict` → `{"model_id", "estimated_credits": int, "source": "estimate"}` from `estimatedCost`. If the estimate endpoint errors (any PixioError except AUTH/INSUFFICIENT_CREDITS), fall back to catalog `credits` → `"source": "catalog"`. If both fail → `{"estimated_credits": None, "source": "unknown"}` plus a `"warning"` string.
+- Shared helper (used by tools/generation.py too): `async def resolve_estimate(model_id: str, params: dict) -> tuple[int | None, str, str | None]` returning `(estimated_credits, source, warning)` — module-level public function in tools/credits.py implementing the fallback chain above.
 - `get_credits(include_ledger_tail: bool = False, ledger_limit: int = 10) -> dict` → `{"total", "recurring": {...}, "permanent"}` (+ `"ledger_tail": [...]` when requested).
 
 ### tools/media.py (B5)
@@ -228,7 +233,45 @@ Base `https://beta.pixio.myapps.ai/api/v1`. Auth `Authorization: Bearer pxio_liv
 
 ## Test requirements (T1–T3)
 
-- Offline only: `httpx.MockTransport` injected via `PixioClient(settings, transport=...)`; `Settings.from_env(env={...})` — never read real env in unit tests, never hit the network. `conftest.py` provides fixtures: `settings`, `mock_api` (a MockTransport handler class with programmable routes + request-capture list), `runtime` (builds Runtime with fakes + `init_runtime`, `reset_runtime()` teardown).
+- Offline only: `httpx.MockTransport` injected via `PixioClient(settings, transport=...)`; `Settings.from_env(env={...})` — never read real env in unit tests, never hit the network.
+- `tests/conftest.py` (T1) provides EXACTLY these fixtures (T2/T3 code against them):
+
+```python
+TEST_KEY = "pxio_live_TESTSECRET123"   # sentinel scanned for in redaction tests
+
+class MockAPI:
+    """Programmable fake Pixio gateway for httpx.MockTransport."""
+    requests: list[httpx.Request]           # every request seen, in order
+    def __init__(self): ...                 # installs DEFAULT routes (below)
+    @property
+    def transport(self) -> httpx.MockTransport
+    def on(self, method: str, path_suffix: str, response: httpx.Response | Callable[[httpx.Request], httpx.Response]) -> None
+    # method upper-case; path_suffix matched against the END of request path, e.g. "/generations/estimate".
+    # Later .on() registrations override earlier/default ones. Callables receive the request.
+
+# DEFAULT routes (all 200 unless stated): GET /models → {"models": [flux-schnell(1c, text-to-image),
+# nano-banana-edit(4c, image-to-image), kling-master(295c, image-to-video)]};
+# GET /params → flux-schnell params (prompt string + image_size select with options[].value);
+# POST /generations/estimate → {"success":true,"modelId":...,"currency":"credits","baseCost":1,"estimatedCost":1};
+# POST /generate → {"success":true,"message":"ok","contentId":"gen-123",...};
+# GET /generations/gen-123 → succeeded, outputUrl https://cdn.example/out.png, outputs {imageUrl: same}, creditsCost 1;
+# GET /credits → {"accountId":"acc","total":1000,"recurring":{"current":1000,"quota":15000,"lastTopOffAt":"..."},"permanent":0};
+# GET /credits/ledger → {"entries":[...2 entries...]};
+# POST /media → {"url":"https://pixiomedia.nyc3.digitaloceanspaces.com/uploads/test.png"};
+# GET https://cdn.example/out.png → 200 PNG magic bytes b"\x89PNG\r\n\x1a\n" + padding, content-type image/png.
+
+@pytest.fixture
+def mock_api() -> MockAPI
+
+@pytest.fixture
+def settings() -> Settings        # api_key=TEST_KEY, defaults otherwise (caps 60/300), download_dir=tmp_path/"outputs"
+
+@pytest.fixture
+def runtime(settings, mock_api) -> Runtime
+# PixioClient(settings, transport=mock_api.transport), BudgetGuard(60, 300), TTLCache(600),
+# init_runtime(...); yields Runtime; teardown: await client.aclose() best-effort + reset_runtime()
+```
+
 - pytest config in pyproject: `asyncio_mode = "auto"`.
 - Must cover (acceptance-criteria mapping — mark with comments `# AC-n`):
   - AC3: estimate over per-job cap → BUDGET_EXCEEDED dict with estimate+cap+confirm hint; same call `confirm=True` → proceeds (mock generate succeeds).
