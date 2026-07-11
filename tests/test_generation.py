@@ -311,6 +311,90 @@ async def test_budget_reconciliation_estimate_matches_actual_no_drift(
     assert runtime.budget.session_spent == 1
 
 
+async def test_concurrent_generates_cannot_overspend_session_budget(
+    runtime: Runtime, mock_api: MockAPI, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Parallel generate() calls cannot race past the session budget.
+
+    Regression: budget.check and the spend record were separated by the
+    awaited POST /generate, so two concurrent calls both passed the check
+    against the same stale session_spent and collectively overspent the
+    session budget without confirm=true.
+    """
+    _install_fast_sleep(monkeypatch)
+    # 200 already spent; two concurrent 60-credit jobs: the first fits
+    # (260 <= 300), the second must be refused (320 > 300).
+    runtime.budget.record_submit("earlier-job", 200)
+    mock_api.on("POST", "/generations/estimate", _estimate_route(60))
+
+    real_generate = runtime.client.generate
+
+    async def slow_generate(model_id: str, params: dict) -> str:
+        await asyncio.sleep(0.02)  # force a suspension like a real round-trip
+        return await real_generate(model_id, params)
+
+    monkeypatch.setattr(runtime.client, "generate", slow_generate)
+
+    results = await asyncio.gather(
+        generate(MODEL_ID, {"prompt": "a"}, wait=True),
+        generate(MODEL_ID, {"prompt": "b"}, wait=True),
+    )
+
+    refused = [r for r in results if isinstance(r.get("error"), dict)]
+    succeeded = [r for r in results if not isinstance(r.get("error"), dict)]
+    assert len(refused) == 1, f"exactly one call must be refused: {results!r}"
+    assert refused[0]["error"]["code"] == "BUDGET_EXCEEDED"
+    assert len(succeeded) == 1
+    assert len(_generate_posts(mock_api)) == 1, "the refused call must not submit"
+    # 200 earlier + the one job (estimate 60 reconciled to actual 1) = 201.
+    assert runtime.budget.session_spent == 201
+    assert runtime.budget.session_spent <= 300
+
+
+async def test_generate_submit_failure_releases_budget_reservation(
+    runtime: Runtime, mock_api: MockAPI
+) -> None:
+    """A failed POST /generate returns the reserved estimate to the budget."""
+    mock_api.on("POST", "/generations/estimate", _estimate_route(50))
+    mock_api.on(
+        "POST", "/generate", httpx.Response(400, json={"error": "bad params"})
+    )
+
+    result = await generate(MODEL_ID, {"prompt": "a cat"}, wait=True)
+
+    assert _error(result)["code"] == "VALIDATION"
+    assert runtime.budget.session_spent == 0, "no submit -> no spend recorded"
+
+
+async def test_poll_phase_error_result_still_carries_generation_id(
+    runtime: Runtime, mock_api: MockAPI, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An upstream/concurrency error during the wait phase keeps the id.
+
+    Regression: credits are committed once POST /generate succeeds and Pixio
+    has no list-generations endpoint, so a poll-phase PixioError that lost
+    the generation_id made the job permanently unreachable.
+    """
+    _install_fast_sleep(monkeypatch)
+    mock_api.on(
+        "GET",
+        "/generations/gen-123",
+        httpx.Response(
+            429,
+            json={"error": "This account has reached its API concurrency limit of 3"},
+        ),
+    )
+
+    result = await generate(MODEL_ID, {"prompt": "a cat"}, wait=True)
+
+    err = _error(result)
+    assert err["code"] == "CONCURRENCY"
+    assert err["details"]["generation_id"] == "gen-123"
+    assert "wait_for_generation" in err["details"]["hint"]
+    # the estimate stays recorded — the job was submitted and may bill.
+    assert runtime.budget.session_spent == 1
+
+
 async def test_get_generation_returns_job_shape_from_single_get(
     runtime: Runtime, mock_api: MockAPI
 ) -> None:

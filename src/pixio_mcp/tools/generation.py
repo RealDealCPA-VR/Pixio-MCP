@@ -114,7 +114,19 @@ async def _poll(generation_id: str, timeout_s: float) -> dict:
     deadline = started + timeout_s
     interval = _POLL_INITIAL_S
     while True:
-        record = await rt.client.get_generation(generation_id)
+        try:
+            record = await rt.client.get_generation(generation_id)
+        except PixioError as err:
+            # Credits may already be committed for this job and Pixio has no
+            # list-generations endpoint — the id MUST survive into the error
+            # result or the caller permanently loses access to the job.
+            err.details.setdefault("generation_id", generation_id)
+            err.details.setdefault(
+                "hint",
+                "the job may still be running server-side; call "
+                "wait_for_generation(generation_id) to resume waiting",
+            )
+            raise
         status = record.get("status")
         if status == _STATUS_SUCCEEDED:
             actual = _as_int(record.get("creditsCost"))
@@ -250,14 +262,22 @@ async def generate(
     rt = get_runtime()
 
     # Step 2 — estimate, then budget guard (0 stands in for unknown).
+    # reserve() checks the caps AND records the estimate in one synchronous
+    # step, so concurrent generate() calls cannot race between check and
+    # record and collectively overspend the session budget.
     estimated, source, warning = await resolve_estimate(model_id, params)
-    rt.budget.check(estimated or 0, confirm)
+    reservation = rt.budget.reserve(estimated or 0, confirm)
 
     # Step 3 — submit. The client never auto-retries this POST.
-    generation_id = await rt.client.generate(model_id, params)
+    try:
+        generation_id = await rt.client.generate(model_id, params)
+    except BaseException:
+        # Nothing was submitted, so nothing was spent — release the hold.
+        rt.budget.release(reservation)
+        raise
 
-    # Step 4 — record the estimate against the session budget immediately.
-    rt.budget.record_submit(generation_id, estimated or 0)
+    # Step 4 — re-key the reserved estimate under the real generation id.
+    rt.budget.commit(reservation, generation_id)
     logger.info(
         "generation submitted: model_id=%s generation_id=%s "
         "estimated_credits=%s source=%s",

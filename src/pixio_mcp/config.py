@@ -181,16 +181,38 @@ class _JsonLinesFormatter(logging.Formatter):
         return json.dumps(payload, default=str, separators=(",", ":"))
 
 
+def _ensure_json_handler(logger: logging.Logger) -> logging.Handler:
+    """Attach the shared JSON-lines stderr handler to *logger* (idempotent)."""
+    for handler in logger.handlers:
+        if handler.get_name() == _HANDLER_NAME:
+            return handler
+    handler = logging.StreamHandler(sys.stderr)
+    handler.set_name(_HANDLER_NAME)
+    handler.setFormatter(_JsonLinesFormatter())
+    logger.addHandler(handler)
+    return handler
+
+
 def setup_logging(level: str) -> None:
-    """Configure the ``pixio_mcp`` logger hierarchy for stderr JSON-lines output.
+    """Configure logging so ALL server output is stderr JSON lines.
 
     Attaches exactly one :class:`logging.StreamHandler` bound to
     ``sys.stderr`` with :class:`_JsonLinesFormatter` to the ``pixio_mcp``
     logger and sets its level from *level* (case-insensitive; unknown names
-    fall back to ``INFO``).
+    fall back to ``INFO``). Propagation is disabled on the ``pixio_mcp``
+    logger so records are never duplicated in plain text through handlers
+    the MCP SDK installs on the root logger.
 
-    Idempotent: repeated calls update the level but never add a duplicate
-    handler. The root logger is never configured or given handlers — stdout
+    Third-party logger hygiene (the logging contract is JSON lines only,
+    path only — never query strings, which may carry params or signatures):
+
+    - ``httpx`` / ``httpcore`` log full request URLs including query strings,
+      so they are capped at WARNING.
+    - the ``mcp`` SDK logger gets the same JSON handler (propagation off) so
+      its records come out as JSON lines instead of plain text.
+
+    Idempotent: repeated calls update the level but never add duplicate
+    handlers. The root logger is never configured or given handlers — stdout
     is reserved for the MCP stdio transport and must stay untouched.
     """
     logger = logging.getLogger("pixio_mcp")
@@ -198,9 +220,12 @@ def setup_logging(level: str) -> None:
         (level or "").strip().upper(), logging.INFO
     )
     logger.setLevel(resolved)
-    if any(handler.get_name() == _HANDLER_NAME for handler in logger.handlers):
-        return
-    handler = logging.StreamHandler(sys.stderr)
-    handler.set_name(_HANDLER_NAME)
-    handler.setFormatter(_JsonLinesFormatter())
-    logger.addHandler(handler)
+    logger.propagate = False
+    _ensure_json_handler(logger)
+
+    for noisy in ("httpx", "httpcore"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+
+    mcp_logger = logging.getLogger("mcp")
+    mcp_logger.propagate = False
+    _ensure_json_handler(mcp_logger)

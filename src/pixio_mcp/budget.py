@@ -14,6 +14,8 @@ real spend without double-counting.
 
 from __future__ import annotations
 
+from uuid import uuid4
+
 from .errors import ErrorCode, PixioError
 
 __all__ = ["BudgetGuard"]
@@ -113,6 +115,54 @@ class BudgetGuard:
                 "session_spent": spent,
             },
         )
+
+    def reserve(self, estimated: int, confirm: bool) -> str:
+        """Atomically check the caps and provisionally record the estimate.
+
+        Combines :meth:`check` and a provisional :meth:`record_submit` in one
+        synchronous step (no ``await`` in between), so concurrent async tool
+        calls each see the spend of every reservation made before theirs —
+        parallel ``generate()`` calls cannot collectively overspend the
+        session budget by racing between check and record.
+
+        Args:
+            estimated: Estimated credit cost of the prospective job.
+            confirm: Explicit caller override; ``True`` bypasses both caps.
+
+        Returns:
+            An opaque reservation token. After the job is submitted, call
+            :meth:`commit` to re-key the reservation under the real
+            generation id; if submission fails, call :meth:`release` to
+            return the reserved credits to the session budget.
+
+        Raises:
+            PixioError: ``BUDGET_EXCEEDED`` exactly as :meth:`check` (nothing
+                is reserved when this raises).
+        """
+        self.check(estimated, confirm)
+        token = f"__reserved__{uuid4().hex}"
+        self.record_submit(token, estimated)
+        return token
+
+    def commit(self, token: str, generation_id: str) -> None:
+        """Re-key a reservation made by :meth:`reserve` under the real id.
+
+        The session total is unchanged (the amount was counted at reserve
+        time); the per-id record moves from *token* to ``generation_id`` so a
+        later :meth:`record_actual` reconciles correctly. Unknown tokens
+        commit 0 credits.
+        """
+        amount = self._recorded.pop(token, 0)
+        self._recorded[generation_id] = self._recorded.get(generation_id, 0) + amount
+
+    def release(self, token: str) -> None:
+        """Return a reservation's credits to the budget (submission failed).
+
+        Subtracts the amount reserved under *token* from the session total
+        and forgets the token. Unknown tokens are a no-op.
+        """
+        amount = self._recorded.pop(token, 0)
+        self._spent = max(0, self._spent - amount)
 
     def record_submit(self, generation_id: str, estimated: int) -> None:
         """Record the estimated cost of a job that was just submitted.

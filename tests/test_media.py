@@ -2,9 +2,10 @@
 
 Covers ``upload_media`` (remote-URL JSON mirror vs local-file multipart, plus
 VALIDATION for missing paths and directories) and ``download_output`` (files
-written with the pinned naming scheme and PNG magic bytes, VALIDATION on a
-still-processing generation pointing at wait_for_generation, GENERATION_FAILED
-on a failed generation, and dest_dir defaulting to settings.download_dir).
+written with the pinned naming scheme and PNG magic bytes, VALIDATION on any
+non-succeeded status — processing points at wait_for_generation, failed
+carries the provider reason — traversal-safe filenames, and dest_dir
+defaulting to settings.download_dir).
 
 All tests run against the ``MockAPI`` transport from conftest — no network.
 """
@@ -178,16 +179,49 @@ async def test_download_output_processing_is_validation(
     assert _cdn_requests(mock_api) == []
 
 
-async def test_download_output_failed_is_generation_failed(
+async def test_download_output_failed_is_validation_with_reason(
     runtime: Runtime, mock_api: MockAPI
 ) -> None:
-    """A failed generation surfaces GENERATION_FAILED instead of downloading."""
+    """A failed generation is refused with VALIDATION (CONTRACTS.md B5:
+    any status != succeeded), stating the status and the provider reason."""
     _set_generation_status(mock_api, "failed", error="NSFW content detected")
 
     result = await download_output("gen-123")
 
-    assert result["error"]["code"] == "GENERATION_FAILED"
+    assert result["error"]["code"] == "VALIDATION"
+    assert "failed" in result["error"]["message"]
+    details = result["error"]["details"]
+    assert details["status"] == "failed"
+    assert details["provider_reason"] == "NSFW content detected"
     assert _cdn_requests(mock_api) == []
+
+
+async def test_download_output_traversal_id_cannot_escape_dest_dir(
+    runtime: Runtime, mock_api: MockAPI, tmp_path: Path
+) -> None:
+    """A traversal-shaped generation_id is sanitized: files stay in dest_dir.
+
+    Regression: the filename stem was built from the raw generation_id, so a
+    hostile/compromised gateway confirming ``../../evil`` as succeeded made
+    the download escape two directories above the requested dest_dir.
+    """
+    evil_id = "../../evil"
+    body = _generation_body("succeeded")
+    body["id"] = evil_id
+    mock_api.on("GET", "/evil", lambda _req: httpx.Response(200, json=body))
+
+    dest = tmp_path / "deep" / "deeper"
+    result = await download_output(evil_id, dest_dir=str(dest))
+
+    assert "error" not in result or not isinstance(result["error"], dict)
+    assert len(result["files"]) == 1
+    written = Path(result["files"][0]).resolve()
+    assert written.is_file()
+    assert written.parent == dest.resolve(), "file must stay inside dest_dir"
+    assert dest.resolve() in written.parents or written.parent == dest.resolve()
+    # nothing may have been written outside dest_dir
+    escaped = [p for p in tmp_path.rglob("*") if p.is_file() and dest.resolve() not in p.resolve().parents]
+    assert escaped == []
 
 
 async def test_download_output_defaults_to_settings_download_dir(

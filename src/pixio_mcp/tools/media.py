@@ -29,6 +29,21 @@ _URL_SUFFIX_RE = re.compile(r"^\.[a-z0-9]{1,6}$")
 #: Bytes of file header needed to identify every format in the sniff table.
 _MAGIC_SNIFF_LEN = 16
 
+#: Characters allowed in an output-filename stem; anything else (path
+#: separators, dots, ...) is replaced so a hostile generation_id can never
+#: traverse out of dest_dir.
+_STEM_UNSAFE_RE = re.compile(r"[^A-Za-z0-9_-]")
+
+
+def _safe_stem_prefix(generation_id: str) -> str:
+    """Return the first 8 chars of *generation_id* made filesystem-safe.
+
+    Path separators, dots, and any other non ``[A-Za-z0-9_-]`` characters are
+    replaced with ``_`` so the resulting filename stem can never escape the
+    destination directory (e.g. a traversal-shaped id like ``../../evil``).
+    """
+    return _STEM_UNSAFE_RE.sub("_", generation_id[:8]) or "gen"
+
 
 def _is_http_url(value: str) -> bool:
     """Return True if *value* is an http(s) URL (case-insensitive scheme)."""
@@ -201,8 +216,9 @@ async def download_output(generation_id: str, dest_dir: str | None = None) -> di
     status ``succeeded``. Output URLs may be signed and expire (~1 hour), so
     download promptly. If the generation is still processing this returns a
     VALIDATION error — call ``wait_for_generation(generation_id)`` first and
-    retry once it succeeds. A failed generation returns GENERATION_FAILED
-    with the provider's reason.
+    retry once it succeeds. Any non-succeeded status (including ``failed``)
+    returns a VALIDATION error stating the current status; for a failed
+    generation the provider's reason is included in the details.
 
     Args:
         generation_id: The id returned by ``generate``.
@@ -212,8 +228,9 @@ async def download_output(generation_id: str, dest_dir: str | None = None) -> di
 
     Returns:
         ``{"generation_id": str, "files": [absolute file paths], "dest_dir": str}``
-        — files are named ``{generation_id[:8]}-{index}{ext}`` with the
-        extension inferred from each URL or the downloaded content.
+        — files are named ``{generation_id[:8]}-{index}{ext}`` (id prefix
+        sanitized to filesystem-safe characters) with the extension inferred
+        from each URL or the downloaded content.
     """
     rt = get_runtime()
 
@@ -221,12 +238,18 @@ async def download_output(generation_id: str, dest_dir: str | None = None) -> di
     status = str(generation.get("status") or "unknown")
 
     if status == "failed":
+        # CONTRACTS.md B5: any status != succeeded is a VALIDATION error
+        # stating the current status (the provider reason rides in details).
         reason = generation.get("error")
         raise PixioError(
-            ErrorCode.GENERATION_FAILED,
-            f"generation '{generation_id}' failed and has no downloadable "
-            f"output: {reason or 'no reason provided by the provider'}",
-            details={"generation_id": generation_id, "provider_reason": reason},
+            ErrorCode.VALIDATION,
+            f"generation '{generation_id}' is not downloadable: status is "
+            f"'failed' ({reason or 'no reason provided by the provider'}).",
+            details={
+                "generation_id": generation_id,
+                "status": status,
+                "provider_reason": reason,
+            },
         )
     if status != "succeeded":
         raise PixioError(
@@ -252,9 +275,10 @@ async def download_output(generation_id: str, dest_dir: str | None = None) -> di
     base = Path(dest_dir).expanduser() if dest_dir is not None else rt.settings.download_dir
     base.mkdir(parents=True, exist_ok=True)
 
+    stem_prefix = _safe_stem_prefix(generation_id)
     files: list[str] = []
     for index, url in enumerate(urls):
-        saved = await _download_one(rt.client, url, base, f"{generation_id[:8]}-{index}")
+        saved = await _download_one(rt.client, url, base, f"{stem_prefix}-{index}")
         files.append(str(saved))
 
     logger.info(

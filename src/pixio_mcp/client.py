@@ -192,9 +192,13 @@ class PixioClient:
         The returned URL is a permanent, public
         ``pixiomedia.nyc3.digitaloceanspaces.com`` location.  Retried once on
         connect errors only (never on HTTP errors).
+
+        The disk read runs in a worker thread so a large media file (Pixio
+        inputs are commonly multi-hundred-MB videos) never blocks the event
+        loop and the MCP protocol handling on it.
         """
         try:
-            data = path.read_bytes()
+            data = await asyncio.to_thread(path.read_bytes)
         except OSError as exc:
             raise PixioError(
                 ErrorCode.VALIDATION,
