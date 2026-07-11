@@ -174,9 +174,9 @@ async def upload_media(
     (e.g. ``image_url``) expect — pass it through verbatim.
 
     Returns:
-        ``{"url": str, "source_kind": "local_file" | "remote_url",
-        "file_name": str, "size_bytes": int | None}`` — ``size_bytes`` is
-        None for remote URLs (the file never transits this machine).
+      ``{"url": str, "source_kind": "local_file" | "remote_url",
+      "file_name": str, "size_bytes": int | None}`` — ``size_bytes`` is
+      None for remote URLs (the file never transits this machine).
     """
     rt = get_runtime()
 
@@ -260,10 +260,10 @@ async def download_output(
     generation the provider's reason is included in the details.
 
     Returns:
-        ``{"generation_id": str, "files": [absolute file paths], "dest_dir": str}``
-        — files are named ``{generation_id[:8]}-{index}{ext}`` (id prefix
-        sanitized to filesystem-safe characters) with the extension inferred
-        from each URL or the downloaded content.
+      ``{"generation_id": str, "files": [absolute file paths], "dest_dir": str}``
+      — files are named ``{generation_id[:8]}-{index}{ext}`` (id prefix
+      sanitized to filesystem-safe characters) with the extension inferred
+      from each URL or the downloaded content.
     """
     rt = get_runtime()
 

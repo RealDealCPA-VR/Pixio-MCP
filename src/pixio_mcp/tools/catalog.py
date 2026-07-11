@@ -101,11 +101,11 @@ async def list_models(
     3. generate(model_id, params) — run the job.
 
     Returns:
-        {"models": [{"id", "name", "type", "credits", "company",
-        "description"}, ...], "total_matching": <matches before pagination>,
-        "returned": <len of "models">, "offset": <effective offset>}.
-        "credits" is the catalog-listed cost per generation; descriptions are
-        truncated to 200 characters. The catalog is cached for ~10 minutes.
+      {"models": [{"id", "name", "type", "credits", "company",
+      "description"}, ...], "total_matching": <matches before pagination>,
+      "returned": <len of "models">, "offset": <effective offset>}.
+      "credits" is the catalog-listed cost per generation; descriptions are
+      truncated to 200 characters. The catalog is cached for ~10 minutes.
     """
     catalog = await get_cached_models()
 
@@ -167,10 +167,10 @@ async def get_model_params(
       param's ``defaultValue`` where you have no better value.
 
     Returns:
-        The gateway /params response verbatim: {"model": {...}, "params":
-        [{"name", "type", "label", "required", "defaultValue",
-        "placeholder"?, "options"?: [{"value", "label"}]}, ...]}.
-        An unknown model id yields a NOT_FOUND error dict.
+      The gateway /params response verbatim: {"model": {...}, "params":
+      [{"name", "type", "label", "required", "defaultValue",
+      "placeholder"?, "options"?: [{"value", "label"}]}, ...]}.
+      An unknown model id yields a NOT_FOUND error dict.
     """
     rt = get_runtime()
     return await rt.client.get_params(_strip_identifier(model_id))
