@@ -266,7 +266,9 @@ async def generate(
         added. On failure: {"error": {"code", "message", "details"}} with
         code VALIDATION, BUDGET_EXCEEDED, INSUFFICIENT_CREDITS, CONCURRENCY,
         GENERATION_FAILED, TIMEOUT_PENDING, NOT_FOUND, AUTH, or
-        UPSTREAM_ERROR.
+        UPSTREAM_ERROR. NOTE: success results also contain an "error" key
+        (the provider reason, null on success) — a call failed only when
+        result["error"] is a dict carrying a "code".
     """
     started = time.monotonic()
 

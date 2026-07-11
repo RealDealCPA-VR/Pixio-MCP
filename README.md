@@ -187,6 +187,8 @@ Credit guardrails are enforced server-side and are non-negotiable by default:
 
 Failed tool calls return `{"error": {"code": ..., "message": ..., "details": {...}}}`. All nine codes:
 
+> **Telling failures apart from successes:** successful job results *also* contain an `error` key — it holds the provider's failure reason and is `null` on success (see the `generate` example above). Don't test `"error" in result`; test whether `result["error"]` is a **dict with a `code`** (tool failure envelope) versus `null`/string (job-result field).
+
 | Code | Meaning | What the caller should do |
 |---|---|---|
 | `AUTH` | 401 from the API, or `PIXIO_API_KEY` is missing/empty. | Set a valid `pxio_live_...` key in the server's `env` and restart the client. |
